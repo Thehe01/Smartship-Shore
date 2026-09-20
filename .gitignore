@@ -1,0 +1,11 @@
+# Build outputs
+target/
+# Local-only Maven sandbox workaround (not part of the project)
+.m2/
+maven-local-settings.xml
+mvn-probe/
+# IDE
+.idea/
+*.iml
+# Local secrets (copy from .env.example, never commit real passwords)
+.env

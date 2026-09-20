@@ -1,0 +1,19 @@
+# Shared test defaults: no external broker, no MySQL, no Flyway.
+# HistoryConsumerTestcontainersTest overrides these via @DynamicPropertySource when Docker exists.
+spring:
+  datasource:
+    url: jdbc:h2:mem:shoretest;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  flyway:
+    enabled: false
+  kafka:
+    listener:
+      auto-startup: false
+
+shore:
+  mqtt:
+    enabled: false
+  kafka:
+    bootstrap-servers: localhost:9092
