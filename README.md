@@ -91,6 +91,10 @@ future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
   `cleanSession=false` 重连，durable session 让 broker 重投原 QoS1；
 - 后续消息照常进入同样的有界交接，不因一次失败停摆；
 - 毒消息仍明确丢弃并 ACK。
+- 最终加固：`client` 引用在 connect **之前**发布（durable 会话恢复后旧 QoS1 可能
+  在 CONNACK 后立即重投，早一刻可见才能正常 ACK），connect/subscribe 失败时清理
+  引用并关闭半连接 client，不遗留 stale；`messageArrivedComplete` 异常不再只记
+  日志，而是与 Kafka 失败同一出口——强制重连 + broker 重投。
 
 ### P2-1.1 Envelope 契约（消灭 data.data）
 

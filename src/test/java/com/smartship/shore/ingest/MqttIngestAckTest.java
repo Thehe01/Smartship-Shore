@@ -1,16 +1,21 @@
 package com.smartship.shore.ingest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
@@ -27,12 +32,15 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
+import org.mockito.MockedConstruction;
 import org.springframework.kafka.support.SendResult;
 
 /**
@@ -182,5 +190,55 @@ class MqttIngestAckTest {
     verify(mqttClient, times(1)).messageArrivedComplete(53, 1);
     verify(mqttClient, never()).disconnectForcibly(anyLong());
     assertEquals(1.0, metrics.getMqttInvalidTotal().count());
+  }
+
+  @Test
+  @DisplayName("Reconnect race: client reference is already visible while connect runs")
+  void clientVisibleBeforeConnectCompletes() throws Exception {
+    try (MockedConstruction<MqttClient> mocked = mockConstruction(MqttClient.class,
+        (mock, context) -> doAnswer(invocation -> {
+          // Inside connect(): the durable session may already redeliver, so the
+          // reference must be published before connect, not after subscribe.
+          assertSame(mock, service.getClientForTests());
+          return null;
+        }).when(mock).connect(any(MqttConnectOptions.class)))) {
+      service.connectAndSubscribe();
+
+      assertEquals(1, mocked.constructed().size());
+      assertSame(mocked.constructed().get(0), service.getClientForTests());
+    }
+  }
+
+  @Test
+  @DisplayName("Connect failure leaves no stale client behind")
+  void noStaleClientAfterConnectFailure() {
+    try (MockedConstruction<MqttClient> mocked = mockConstruction(MqttClient.class,
+        (mock, context) -> doThrow(new MqttException(32103))
+            .when(mock).connect(any(MqttConnectOptions.class)))) {
+      assertThrows(MqttException.class, () -> service.connectAndSubscribe());
+
+      assertEquals(1, mocked.constructed().size());
+      assertNull(service.getClientForTests(),
+          "a half-connected client must never stay published");
+    }
+  }
+
+  @Test
+  @DisplayName("MQTT ACK failure is not success: forces redelivery reconnect, no ack observed")
+  @SuppressWarnings("unchecked")
+  void ackFailureTriggersRedelivery() throws Exception {
+    doReturn(CompletableFuture.completedFuture(mock(SendResult.class)))
+        .when(producer).send(anyString(), any(TelemetryEnvelope.class));
+    doThrow(new MqttException(32102))
+        .when(mqttClient).messageArrivedComplete(anyInt(), anyInt());
+    java.util.List<Integer> acked = new java.util.concurrent.CopyOnWriteArrayList<>();
+    service.setAckListener(acked::add);
+
+    service.messageArrived("zncb/413999999/nmea_gps", message(EdgeFixtures.gpsPayload(), 61));
+
+    verify(mqttClient, times(1)).messageArrivedComplete(61, 1);
+    assertTrue(acked.isEmpty(), "a failed ACK must not count as acknowledged");
+    // Same recovery as every other failure exit: forced reconnect on a background thread.
+    verify(mqttClient, timeout(5000).times(1)).disconnectForcibly(anyLong());
   }
 }

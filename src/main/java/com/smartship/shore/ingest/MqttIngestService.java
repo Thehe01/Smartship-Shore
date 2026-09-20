@@ -132,19 +132,35 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
     // Manual acknowledgments: nothing is ACKed to the broker until the Kafka handoff succeeds
     // (see messageArrived). Must be set before connect.
     newClient.setManualAcks(true);
-    MqttConnectOptions options = new MqttConnectOptions();
-    options.setAutomaticReconnect(mqtt.isAutoReconnect());
-    options.setCleanSession(mqtt.isCleanSession());
-    options.setKeepAliveInterval(mqtt.getKeepAliveInterval());
-    options.setConnectionTimeout(mqtt.getConnectionTimeout());
-    if (StringUtils.hasText(mqtt.getUsername())) {
-      options.setUserName(mqtt.getUsername());
-      options.setPassword(mqtt.getPassword() == null ? new char[0] : mqtt.getPassword().toCharArray());
-    }
-    newClient.setCallback(this);
-    newClient.connect(options);
-    newClient.subscribe(mqtt.getTopics(), mqtt.getQos(), this);
+    // Publish the reference BEFORE connect: with a durable session the broker may redeliver
+    // unacked QoS1 immediately after CONNACK, and completeDelivery() must already see a client
+    // instead of a null reference.
     client = newClient;
+    try {
+      MqttConnectOptions options = new MqttConnectOptions();
+      options.setAutomaticReconnect(mqtt.isAutoReconnect());
+      options.setCleanSession(mqtt.isCleanSession());
+      options.setKeepAliveInterval(mqtt.getKeepAliveInterval());
+      options.setConnectionTimeout(mqtt.getConnectionTimeout());
+      if (StringUtils.hasText(mqtt.getUsername())) {
+        options.setUserName(mqtt.getUsername());
+        options.setPassword(mqtt.getPassword() == null ? new char[0] : mqtt.getPassword().toCharArray());
+      }
+      newClient.setCallback(this);
+      newClient.connect(options);
+      newClient.subscribe(mqtt.getTopics(), mqtt.getQos(), this);
+    } catch (Exception e) {
+      // Never leak a half-connected client: the next attempt rebuilds from scratch.
+      if (client == newClient) {
+        client = null;
+      }
+      try {
+        newClient.close();
+      } catch (Exception closeNoise) {
+        log.debug("[Shore-MQTT] client close noise: {}", closeNoise.getMessage());
+      }
+      throw e;
+    }
     log.info("[Shore-MQTT] subscribed: broker={}, filter={}, qos={}",
         mqtt.getBrokerUrl(), mqtt.getTopics(), mqtt.getQos());
   }
@@ -317,7 +333,8 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
   /**
    * Completes one MQTT delivery towards the broker. Called only for validated envelopes whose
    * Kafka send succeeded, or for deliberately dropped poison payloads — never for failed
-   * handoffs. Package-visible for contract tests.
+   * handoffs. A failed acknowledgment is NOT success: it forces the same redelivery
+   * reconnect as any other failure exit. Package-visible for contract tests.
    */
   void completeDelivery(MqttMessage message) {
     MqttClient c = client;
@@ -334,15 +351,23 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
         }
       }
     } catch (Exception e) {
-      // The message stays unacknowledged; the broker will redeliver it.
-      log.warn("[Shore-MQTT] MQTT acknowledgment failed, awaiting redelivery:"
+      // The delivery stays unconfirmed AND the connection is recycled, so the durable
+      // session redelivers it: Kafka failure / timeout / MQTT ACK failure all converge
+      // on forced reconnect + broker redelivery of the original QoS1.
+      log.warn("[Shore-MQTT] MQTT acknowledgment failed, forcing redelivery:"
           + " id={}, err={}", message.getId(), e.getMessage());
+      triggerRedeliveryReconnect("mqtt-ack-failure:" + e.getMessage());
     }
   }
 
   /** Test hook: injects the client used by {@link #completeDelivery}. */
   void setClientForTests(MqttClient client) {
     this.client = client;
+  }
+
+  /** Test hook: observes the currently published client reference. */
+  MqttClient getClientForTests() {
+    return client;
   }
 
   /** Acknowledgment observer, used by handoff contract tests. */
