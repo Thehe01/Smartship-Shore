@@ -1,8 +1,8 @@
 package com.smartship.shore.kafka;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.smartship.shore.ingest.InvalidTelemetryException;
-import com.smartship.shore.ingest.TelemetryMessageParser;
 import com.smartship.shore.model.TelemetryEnvelope;
 import com.smartship.shore.observability.ShoreMetrics;
 import com.smartship.shore.persistence.TelemetryHistoryEntity;
@@ -25,8 +25,11 @@ import org.springframework.stereotype.Component;
  *
  * <p>Ordering contract per record:
  * <ol>
- *   <li>Kafka record -&gt; envelope parse/validation (poison is logged, counted and skipped —
- *   retrying it forever would stall the partition; Retry/DLT topics arrive in P2-2).</li>
+ *   <li>Kafka value -&gt; direct {@link TelemetryEnvelope} deserialization + required-field
+ *   validation. The value is already an envelope (written by {@code TelemetryKafkaProducer});
+ *   it must <b>not</b> go through the Edge flat-JSON parser again, otherwise the business map
+ *   would nest as {@code data.data.*}. Poison is logged, counted and skipped — retrying it
+ *   forever would stall the partition; Retry/DLT topics arrive in P2-2.</li>
  *   <li>{@code UNIQUE(msg_id)} idempotency check + MySQL insert.</li>
  *   <li>Offset acknowledged <b>only after</b> the insert succeeded. Never the reverse.</li>
  * </ol>
@@ -43,7 +46,6 @@ import org.springframework.stereotype.Component;
 public class HistoryConsumer {
 
   private final TelemetryHistoryRepository repository;
-  private final TelemetryMessageParser parser;
   private final ObjectMapper objectMapper;
   private final ShoreMetrics metrics;
 
@@ -56,7 +58,7 @@ public class HistoryConsumer {
 
     final TelemetryEnvelope envelope;
     try {
-      envelope = parser.parse(record.value());
+      envelope = readEnvelope(record.value());
     } catch (InvalidTelemetryException e) {
       // Poison record already in Kafka (the MQTT layer filters these, but defense in depth):
       // log it with partition/offset and skip. P2-2 will route these to a DLT.
@@ -119,6 +121,43 @@ public class HistoryConsumer {
           envelope.getMsgId(), e.toString());
       acknowledgment.acknowledge();
     }
+  }
+
+  /**
+   * Reads one Kafka value straight into the envelope contract. The value was written by
+   * {@code TelemetryKafkaProducer} from a validated envelope, so no Edge flat-JSON parsing
+   * applies here — re-parsing would nest the business map under {@code data.data}.
+   */
+  private TelemetryEnvelope readEnvelope(String json) {
+    final TelemetryEnvelope envelope;
+    try {
+      envelope = objectMapper.readValue(json, TelemetryEnvelope.class);
+    } catch (JsonProcessingException e) {
+      throw new InvalidTelemetryException("Kafka value is not a TelemetryEnvelope: "
+          + truncate(json), e);
+    }
+    if (envelope == null
+        || isBlank(envelope.getMsgId())
+        || isBlank(envelope.getMmsi())
+        || isBlank(envelope.getType())) {
+      throw new InvalidTelemetryException(
+          "Kafka envelope misses required msg_id/mmsi/type: " + truncate(json));
+    }
+    if (envelope.getData() == null) {
+      envelope.setData(new java.util.LinkedHashMap<>());
+    }
+    return envelope;
+  }
+
+  private static boolean isBlank(String s) {
+    return s == null || s.trim().isEmpty();
+  }
+
+  private static String truncate(String s) {
+    if (s == null) {
+      return "null";
+    }
+    return s.length() <= 300 ? s : s.substring(0, 300) + "...";
   }
 
   private String toPayloadJson(TelemetryEnvelope envelope) {

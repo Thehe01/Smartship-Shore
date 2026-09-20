@@ -93,6 +93,9 @@ public class KafkaConfig {
     // Raw JSON string; parsing/validation stays inside HistoryConsumer for a clear policy.
     configs.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
     configs.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+    // A brand-new group replays the raw topic from the beginning instead of skipping history;
+    // UNIQUE(msg_id) downstream absorbs anything already stored. Safe under at-least-once.
+    configs.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
     return new DefaultKafkaConsumerFactory<>(configs);
   }
 

@@ -1,6 +1,6 @@
 # Smartship-Shore
 
-岸端事件处理系统 **P2-1**：`MQTT → Kafka → DB` 最小可靠链路（单体 Spring Boot，不拆微服务）。
+岸端事件处理系统 **P2-1 / P2-1.1**：`MQTT → Kafka → DB` 最小可靠链路（单体 Spring Boot，不拆微服务）。
 
 > 本阶段只做 `MQTT → Kafka → MySQL`。Redis、WebSocket、Elasticsearch、告警、微服务拆分、
 > Retry/DLT 均为后续阶段，当前代码不包含。
@@ -20,7 +20,7 @@ Smartship Edge
   Mosquitto
       │
       ▼
-MqttIngestService        解析 + 校验 (msg_id/mmsi/type 必填)
+MqttIngestService        解析 + 校验 → Kafka(异步) → 成功才 ACK MQTT
       │
       ▼
 Kafka Producer           key = MMSI, acks=all + 幂等
@@ -64,6 +64,27 @@ kafkaTemplate.send("ship.telemetry.raw", envelope.getMmsi(), envelope);
   被视为“已处理成功”并正常提交 offset，不重试、不报错升级。
 - 崩溃窗口可解释：`DB insert 成功 → commit offset 前 crash → Kafka 再投递 →
   UNIQUE(msg_id) 拦截 → offset 正常推进`，最终永远只有一行。
+
+### P2-1.1 可靠交接（MQTT ACK 只跟随 Kafka 成功）
+
+旧链路有个丢消息窗口：`messageArrived()` 里异步 `send()` 后立即返回，Paho 先 ACK，
+而 Kafka 后续可能失败 —— 消息两边都没留下。P2-1.1 关闭这个窗口：
+
+- Paho 启用 manual ACK（`setManualAcks(true)`，connect 之前设置）；
+- Kafka send future **成功**后才调 `messageArrivedComplete(id, qos)`；
+- send 失败（异步失败或同步拒绝）时绝不 ACK，只记指标 + 日志，等 QoS1 重投；
+- 交接全异步，不阻塞 Paho 线程等 Kafka（拒绝“同步等待 + 吞异常”的伪可靠）；
+- 故意丢弃的毒消息照常 ACK，避免单条坏消息在 broker 上无限循环。
+- 因此完整崩溃窗口变成：`MQTT 未 ACK → shore crash → broker 重投 →
+  Kafka → DB → UNIQUE 吸收 → 双双确认`，依然只有一行。
+
+### P2-1.1 Envelope 契约（消灭 data.data）
+
+- MQTT 入站：Edge 扁平 JSON → `TelemetryMessageParser` → `TelemetryEnvelope`（不变）。
+- Kafka 出站：Producer 直接序列化 `TelemetryEnvelope`（`data` 即业务 Map）。
+- Kafka 入站：Consumer 用 `objectMapper.readValue(value, TelemetryEnvelope.class)`
+  直接反序列化 + 必填校验，**不再经过 flat-JSON parser**（否则 `data` 会被当成
+  普通业务字段再包一层，出现 `data.data.speed_knots`）。
 
 ## 3. Edge MQTT 协议（以 Edge 源码为准，非自创）
 
@@ -135,7 +156,11 @@ mvn clean package
 | 5 | `HistoryConsumerTest` crash window | 先直接 insert（模拟 crash 前已提交），再投递：仍 `row=1` |
 | 6 | `HistoryConsumerTest` 多 MMSI | A/B 两船各自一行 |
 | — | `HistoryConsumerTest` 毒消息/瞬时异常 | 非法 JSON 跳过并 ACK；瞬时 DB 异常不 ACK 并抛给重投 |
+| — | `HistoryConsumerTest` Envelope 契约 | 直接反序列化、`data.speed_knots` 扁平、无 `data.data`、缺字段跳过 |
+| — | `MqttIngestAckTest` 交接契约 | 成功才 ACK / 失败不 ACK / 同步拒绝不 ACK / 毒消息丢弃并 ACK |
 | E2E | `HistoryConsumerTestcontainersTest` | 真实 Kafka(KRaft)+MySQL（含 Flyway V1）；无 Docker 时自动跳过 |
+| E2E | `TrueE2EMqttKafkaMySqlTest` | 真实 Mosquitto→岸端服务→Kafka→Consumer→MySQL；断言 row=1、`data.speed_knots=12.5`、无 `data.data`；无 Docker 跳过 |
+| E2E | `MqttKafkaHandoffReliabilityTest` | Kafka 中断时 MQTT 不 ACK；恢复后重投递只一行、重复被吸收；无 Docker 跳过 |
 
 测试不依赖公网 Kafka / 公网 Broker / 真实船舶；不断言跨 partition 全局顺序。
 
