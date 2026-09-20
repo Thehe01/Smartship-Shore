@@ -25,15 +25,21 @@ import org.springframework.util.StringUtils;
  * Subscribes to the real Edge topics ({@code zncb/+/+}) and forwards validated envelopes to Kafka.
  *
  * <p>Pipeline per MQTT delivery: raw payload -&gt; JSON parse -&gt; required-field validation
- * -&gt; {@link TelemetryEnvelope} -&gt; Kafka producer (async, never blocking the Paho thread).
+ * -&gt; {@link TelemetryEnvelope} -&gt; Kafka producer with a <b>bounded synchronous
+ * handoff</b> (P2-1.2).
  *
- * <p><b>Reliable handoff (P2-1.1):</b> the Paho client runs with {@code setManualAcks(true)}, so
- * the broker keeps every QoS1 message until shore explicitly completes it. The MQTT acknowledgment
- * ({@code messageArrivedComplete}) fires <b>only after the Kafka send future succeeds</b>. When
- * the Kafka send fails, shore stays silent (metric + log) and the broker redelivers later, so
- * at-least-once holds end to end and downstream {@code UNIQUE(msg_id)} absorbs the duplicate.
- * Deliberately dropped poison payloads are still acknowledged: one bad message must neither kill
- * the subscriber thread nor loop on the broker forever. Every failure path is caught.
+ * <p><b>Reliable, ordered handoff (P2-1.2):</b> the Paho client runs with
+ * {@code setManualAcks(true)}, so the broker keeps every QoS1 message until shore explicitly
+ * completes it. Inside {@code messageArrived} shore waits for the Kafka send future with a
+ * configured timeout ({@code shore.mqtt.kafka-handoff-timeout-ms}, default 5s — never
+ * infinite). The Paho callback thread is serial, so this bounded wait additionally guarantees
+ * MQTT acknowledgments leave in arrival order. On Kafka success the delivery is completed via
+ * {@code messageArrivedComplete}. On Kafka failure or timeout shore stays silent (metric +
+ * log, no ACK) and <b>actively drops the current MQTT connection</b>; the durable session
+ * ({@code cleanSession=false}, stable client id) makes the broker redeliver the original QoS1
+ * message on reconnect, while downstream {@code UNIQUE(msg_id)} absorbs any duplicate.
+ * Deliberately dropped poison payloads are still acknowledged: one bad message must neither
+ * kill the subscriber thread nor loop on the broker forever. Every failure path is caught.
  *
  * <p>Startup never fails because the broker is down: a background task retries connect +
  * subscribe until it succeeds, and Paho automatic-reconnect plus re-subscribe covers later drops.
@@ -52,6 +58,8 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
   private ScheduledExecutorService starter;
   /** Test observability hook: notified after every successful broker acknowledgment. */
   private volatile AckListener ackListener;
+  /** Coalesces forced reconnects when consecutive handoffs fail. */
+  private final AtomicBoolean redeliveryReconnectPending = new AtomicBoolean(false);
 
   public MqttIngestService(
       ShoreProperties properties,
@@ -62,6 +70,16 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
     this.parser = parser;
     this.producer = producer;
     this.metrics = metrics;
+    // Eager executor so the redelivery-reconnect path never depends on start() timing.
+    this.starter = newStarter();
+  }
+
+  private static ScheduledExecutorService newStarter() {
+    return Executors.newSingleThreadScheduledExecutor(r -> {
+      Thread t = new Thread(r, "shore-mqtt-starter");
+      t.setDaemon(true);
+      return t;
+    });
   }
 
   @PostConstruct
@@ -71,11 +89,9 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
       return;
     }
     running.set(true);
-    starter = Executors.newSingleThreadScheduledExecutor(r -> {
-      Thread t = new Thread(r, "shore-mqtt-starter");
-      t.setDaemon(true);
-      return t;
-    });
+    if (starter == null || starter.isShutdown()) {
+      starter = newStarter();
+    }
     // First attempt immediately; retry forever on the configured delay until subscribed.
     starter.execute(this::connectOnce);
   }
@@ -83,8 +99,10 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
   @PreDestroy
   public void stop() {
     running.set(false);
-    if (starter != null) {
-      starter.shutdownNow();
+    ScheduledExecutorService exec = starter;
+    starter = null;
+    if (exec != null) {
+      exec.shutdownNow();
     }
     disconnectQuietly();
   }
@@ -208,29 +226,92 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
     }
     final java.util.concurrent.CompletableFuture<?> sendFuture;
     try {
-      // Async handoff: never block the Paho thread waiting for Kafka, and never swallow
-      // the outcome — the MQTT acknowledgment below is driven by the send future itself.
       sendFuture = producer.send(properties.getKafka().getRawTopic(), envelope);
     } catch (Exception e) {
       // Synchronous rejection (e.g. serializer/buffer failure): no ACK, broker will redeliver.
       metrics.kafkaProduceFailed();
-      log.warn("[Shore-MQTT] Kafka handoff rejected, awaiting broker redelivery:"
+      log.warn("[Shore-MQTT] Kafka handoff rejected, forcing redelivery:"
           + " mmsi={}, msg_id={}, err={}",
           envelope.getMmsi(), envelope.getMsgId(), e.getMessage());
+      triggerRedeliveryReconnect("sync-reject:" + e.getMessage());
       return;
     }
-    sendFuture.whenComplete((result, ex) -> {
-      if (ex != null) {
-        // Kafka-side failure is already counted/logged by TelemetryKafkaProducer.
-        // Stay silent towards the broker: the message remains unacknowledged and
-        // QoS1 redelivers it later.
-        log.warn("[Shore-MQTT] Kafka send failed, awaiting broker redelivery:"
-            + " mmsi={}, msg_id={}",
-            envelope.getMmsi(), envelope.getMsgId());
-        return;
+    // Bounded synchronous handoff on the (serial) Paho callback thread: the wait always ends
+    // — success, broker failure, or timeout — so acknowledgments leave in arrival order and
+    // the callback can never block forever.
+    try {
+      sendFuture.get(properties.getMqtt().getKafkaHandoffTimeoutMs(), TimeUnit.MILLISECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      handoffFailed(envelope, "interrupted");
+      return;
+    } catch (java.util.concurrent.TimeoutException e) {
+      handoffFailed(envelope, "kafka-ack-timeout");
+      return;
+    } catch (java.util.concurrent.ExecutionException e) {
+      // Async Kafka failure is already counted/logged by TelemetryKafkaProducer; just
+      // hold the MQTT acknowledgment here so QoS1 redelivers the original message.
+      handoffFailed(envelope, e.getCause() != null ? e.getCause().toString() : e.toString());
+      return;
+    }
+    completeDelivery(message);
+  }
+
+  /**
+   * Failed-handoff path: no MQTT acknowledgment, then force a reconnect so the durable
+   * session makes the broker redeliver the original QoS1 message. Consumption of later
+   * messages is not halted — each delivery still runs the same bounded handoff.
+   */
+  private void handoffFailed(TelemetryEnvelope envelope, String cause) {
+    log.warn("[Shore-MQTT] Kafka handoff failed, holding MQTT for broker redelivery:"
+        + " mmsi={}, msg_id={}, cause={}",
+        envelope.getMmsi(), envelope.getMsgId(), cause);
+    triggerRedeliveryReconnect(cause);
+  }
+
+  /**
+   * Drops the current MQTT connection on a background thread (never the Paho callback
+   * thread, which must not block on disconnect) and reconnects immediately with the same
+   * client id and {@code cleanSession=false}, so the broker redelivers unacknowledged QoS1.
+   * Concurrent failures coalesce into a single reconnect.
+   */
+  private void triggerRedeliveryReconnect(String reason) {
+    ScheduledExecutorService exec = starter;
+    if (exec == null || exec.isShutdown()) {
+      return;
+    }
+    if (!redeliveryReconnectPending.compareAndSet(false, true)) {
+      log.debug("[Shore-MQTT] redelivery reconnect already pending");
+      return;
+    }
+    exec.execute(() -> {
+      try {
+        log.warn("[Shore-MQTT] forcing reconnect to trigger broker redelivery: {}", reason);
+        disconnectForciblyQuietly();
+      } finally {
+        redeliveryReconnectPending.set(false);
       }
-      completeDelivery(message);
+      // connectOnce re-checks running itself; after stop() it returns immediately.
+      connectOnce();
     });
+  }
+
+  /** Immediate, non-quiescing disconnect: safe from any thread, never blocks the callback. */
+  private synchronized void disconnectForciblyQuietly() {
+    MqttClient c = client;
+    client = null;
+    if (c != null) {
+      try {
+        c.disconnectForcibly(1000);
+      } catch (Exception e) {
+        log.debug("[Shore-MQTT] forced disconnect noise: {}", e.getMessage());
+      }
+      try {
+        c.close();
+      } catch (Exception e) {
+        log.debug("[Shore-MQTT] client close noise: {}", e.getMessage());
+      }
+    }
   }
 
   /**

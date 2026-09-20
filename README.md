@@ -78,6 +78,20 @@ kafkaTemplate.send("ship.telemetry.raw", envelope.getMmsi(), envelope);
 - 因此完整崩溃窗口变成：`MQTT 未 ACK → shore crash → broker 重投 →
   Kafka → DB → UNIQUE 吸收 → 双双确认`，依然只有一行。
 
+### P2-1.2 有序可重投交接（有界同步等待 + 主动断线）
+
+P2-1.1 还有两个剩余问题：Kafka 失败后原消息未必在当前连接自动重投；多个异步
+future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
+
+- `messageArrived` 内对 send future 做**有界等待**
+  （`future.get(shore.mqtt.kafka-handoff-timeout-ms)`，默认 5s，永不无限阻塞）；
+- Paho 回调线程本就串行，有界等待使 **ACK 顺序恒等于到达顺序**；
+- 成功 → `messageArrivedComplete`；失败/超时 → 不 ACK + 指标 + 日志，
+  并**主动断开当前 MQTT 连接**，以后台线程立即用同一 clientId +
+  `cleanSession=false` 重连，durable session 让 broker 重投原 QoS1；
+- 后续消息照常进入同样的有界交接，不因一次失败停摆；
+- 毒消息仍明确丢弃并 ACK。
+
 ### P2-1.1 Envelope 契约（消灭 data.data）
 
 - MQTT 入站：Edge 扁平 JSON → `TelemetryMessageParser` → `TelemetryEnvelope`（不变）。
@@ -157,16 +171,22 @@ mvn clean package
 | 6 | `HistoryConsumerTest` 多 MMSI | A/B 两船各自一行 |
 | — | `HistoryConsumerTest` 毒消息/瞬时异常 | 非法 JSON 跳过并 ACK；瞬时 DB 异常不 ACK 并抛给重投 |
 | — | `HistoryConsumerTest` Envelope 契约 | 直接反序列化、`data.speed_knots` 扁平、无 `data.data`、缺字段跳过 |
-| — | `MqttIngestAckTest` 交接契约 | 成功才 ACK / 失败不 ACK / 同步拒绝不 ACK / 毒消息丢弃并 ACK |
+| — | `MqttIngestAckTest` 交接契约（P2-1.2） | 成功同步 ACK / 失败不 ACK 并主动断线 / 超时有界不 ACK 并断线 / 到达顺序 ACK / 毒消息丢弃并 ACK |
 | E2E | `HistoryConsumerTestcontainersTest` | 真实 Kafka(KRaft)+MySQL（含 Flyway V1）；无 Docker 时自动跳过 |
 | E2E | `TrueE2EMqttKafkaMySqlTest` | 真实 Mosquitto→岸端服务→Kafka→Consumer→MySQL；断言 row=1、`data.speed_knots=12.5`、无 `data.data`；无 Docker 跳过 |
-| E2E | `MqttKafkaHandoffReliabilityTest` | Kafka 中断时 MQTT 不 ACK；恢复后重投递只一行、重复被吸收；无 Docker 跳过 |
+| E2E | `MqttRedeliveryE2ETest`（P2-1.2） | 只 publish 一次：首次 handoff 失败→不断线重投原 QoS1→恢复后恰一行，`msg_id` 不变；无 Docker 跳过 |
+
+> P2-1.1 的 `MqttKafkaHandoffReliabilityTest`（脚本重发模拟重投）已被 P2-1.2 的
+> 真实原消息重投 E2E 取代并删除：手动重发会与 broker 的真实重投竞态，断言不再可靠。
 
 测试不依赖公网 Kafka / 公网 Broker / 真实船舶；不断言跨 partition 全局顺序。
 
 ## 7. 已知限制（诚实声明）
 
 - at-least-once，不是 exactly-once；重复由 `UNIQUE(msg_id)` 吸收。
+- MQTT 交接等待有界（默认 5s，可配 `shore.mqtt.kafka-handoff-timeout-ms`）；
+  Kafka 长时间不可用时，每条消息触发一次断线重连（已合并连续失败为单次重连），
+  属 P2-1 级别的简单可解释策略，精细退避留给后续阶段。
 - Producer 异步发送失败只记指标 + 日志（P2-2 才做 Retry/DLT）。
 - Kafka 毒消息当前跳过并 ACK（有错误日志 + 指标），P2-2 转 DLT。
 - 单 consumer（`concurrency=1`，保 partition 内顺序写库）；吞吐上限即单线程写库能力，未做 benchmark。

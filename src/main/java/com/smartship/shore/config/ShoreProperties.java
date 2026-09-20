@@ -42,6 +42,14 @@ public class ShoreProperties {
     private String password;
     /** Delay between reconnect attempts when the broker is unreachable at startup. */
     private long connectRetryDelayMs = 5000L;
+    /**
+     * Bounded wait for the Kafka broker acknowledgment inside the MQTT callback
+     * ({@code shore.mqtt.kafka-handoff-timeout-ms}, default 5s). The Paho callback thread
+     * is serial, so this wait also keeps MQTT acknowledgments in arrival order. Never
+     * infinite: on timeout the message stays unacknowledged and a reconnect is forced
+     * so the broker redelivers it.
+     */
+    private long kafkaHandoffTimeoutMs = 5000L;
   }
 
   @Data
