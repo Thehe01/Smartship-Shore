@@ -22,7 +22,7 @@ jobs:
           cache: maven
 
       # GitHub-hosted runners ship Docker, so every Testcontainers E2E
-      # (Mosquitto / Kafka / MySQL / Redis) runs for real here — nothing
+      # (Mosquitto / Kafka / MySQL / Redis) runs for real here: nothing
       # may be skipped or disabled to get green.
       - name: Run full test suite
         run: mvn -B clean test
@@ -30,10 +30,16 @@ jobs:
       - name: Summarize test results
         if: always()
         run: |
+          shopt -s nullglob
+          files=(target/surefire-reports/*.txt)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "FAIL: no surefire reports found (compile failure?)"
+            exit 1
+          fi
           echo "=== Surefire per-class summary ==="
-          grep -h "Tests run" target/surefire-reports/*.txt
+          grep -h "Tests run" "${files[@]}"
           echo "=== Totals ==="
-          TOTALS=$(grep -h "Tests run" target/surefire-reports/*.txt \
+          TOTALS=$(grep -h "Tests run" "${files[@]}" \
             | awk -F'[:,]' '{r+=$2; f+=$4; e+=$6; s+=$8} END {print r+0, f+0, e+0, s+0}')
           echo "tests run / failures / errors / skipped: $TOTALS"
           set -- $TOTALS
