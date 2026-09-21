@@ -7,7 +7,7 @@
 
 | 场景 | 故障 | 验证 | 状态 |
 |---|---|---|---|
-| P2-4.2.1 | MySQL 短暂故障（pause → 恢复） | transient retry → 恢复后落库，Redis 不受影响，DLT 0 | ✅ CI 已绿，run URL 待补 |
+| P2-4.2.1 | MySQL 短暂故障（pause → 恢复） | transient retry → 恢复后落库，Redis 不受影响，DLT 0 | ✅ CI 已绿（[Run 35630161627](https://github.com/Thehe01/Smartship-Shore/actions/runs/35630161627)） |
 | P2-4.2.2 | Redis 短暂故障 | 待做 | ⬜ |
 | P2-4.2.3 | MySQL 持续故障 → DLT | 待做 | ⬜ |
 | P2-4.2.4 | Redis 持续故障 → DLT | 待做 | ⬜ |
@@ -34,7 +34,7 @@
   `history_retry{transient} > 0`、`history_persisted` 增量 == 1、
   DLT 两 bucket 均为 0、Redis payload 的 `msg_id`/`timestamp` 正确且 TTL 生效、
   `lost == 0`。
-- **实跑**：CI 已绿（`ci` workflow，Docker 实跑；run URL 待补）。
+- **实跑**：CI 已绿（[Run 35630161627](https://github.com/Thehe01/Smartship-Shore/actions/runs/35630161627)）。
   途中修过一次测试自伤：故障期间曾用 `repository.countAll()` 做“零落库”
   断言，直查 paused MySQL 导致测试线程自己超时 ERROR
   （`b1a580d` 改为读 `history_persisted` 增量，故障期间不再用故障组件观测）。
