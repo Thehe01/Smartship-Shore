@@ -262,8 +262,15 @@ class ShoreBenchmarkTest {
     Duration budget = Duration.ofSeconds(90L + size / 100L);
 
     // B. End-to-end completion: first send -> MySQL holding every row.
-    MqttTestSupport.waitUntil("history complete for " + size, budget,
-        () -> repository.countAll() == size);
+    // On timeout the assertion carries progress (rows/distinct/counters) so a
+    // red 10k/50k run still tells whether the pipe stalled early or just slowed.
+    try {
+      MqttTestSupport.waitUntil("history complete for " + size, budget,
+          () -> repository.countAll() == size);
+    } catch (AssertionError e) {
+      throw new AssertionError(
+          "history incomplete for " + size + ": " + progressSnapshot(countersBefore), e);
+    }
     long historyDone = System.nanoTime();
 
     long rows = jdbcTemplate.queryForObject(
@@ -284,15 +291,21 @@ class ShoreBenchmarkTest {
 
     // Redis converge: every expected key holding its final (latest) event.
     Map<String, ExpectedLatest> expected = expectedLatest(runId, size);
-    MqttTestSupport.waitUntil("redis converged for " + size, budget, () -> {
-      for (Map.Entry<String, ExpectedLatest> e : expected.entrySet()) {
-        Object payload = redisTemplate.opsForHash().entries(e.getKey()).get("payload");
-        if (payload == null || !payload.toString().contains(e.getValue().msgId())) {
-          return false;
+    try {
+      MqttTestSupport.waitUntil("redis converged for " + size, budget, () -> {
+        for (Map.Entry<String, ExpectedLatest> e : expected.entrySet()) {
+          Object payload = redisTemplate.opsForHash().entries(e.getKey()).get("payload");
+          if (payload == null || !payload.toString().contains(e.getValue().msgId())) {
+            return false;
+          }
         }
-      }
-      return true;
-    });
+        return true;
+      });
+    } catch (AssertionError e) {
+      throw new AssertionError("redis unconverged for " + size + ": "
+          + matchedKeys(expected) + "/" + expected.size() + " keys, "
+          + progressSnapshot(countersBefore), e);
+    }
     long redisDone = System.nanoTime();
 
     // Full per-key verification: timestamp AND msg_id equal the input latest.
@@ -511,6 +524,39 @@ class ShoreBenchmarkTest {
     }
     throw new IllegalArgumentException(
         "unsupported datetime value: " + (value == null ? "null" : value.getClass()));
+  }
+
+  /** One-line progress for timeout assertions: rows/distinct + consumer counters. */
+  private String progressSnapshot(Map<String, Double> countersBefore) {
+    long rows = -1;
+    long distinct = -1;
+    try {
+      rows = jdbcTemplate.queryForObject(
+          "SELECT COUNT(*) FROM ship_telemetry_history", Long.class);
+      distinct = jdbcTemplate.queryForObject(
+          "SELECT COUNT(DISTINCT msg_id) FROM ship_telemetry_history", Long.class);
+    } catch (Exception ignored) {
+      // Best effort; the counters below still discriminate stall vs slowdown.
+    }
+    Map<String, Double> after = snapshotCounters();
+    Map<String, Double> delta = new LinkedHashMap<>();
+    after.forEach((k, v) -> delta.put(k, v - countersBefore.getOrDefault(k, 0.0)));
+    return "rows=" + rows + " distinct=" + distinct + " delta=" + delta;
+  }
+
+  private int matchedKeys(Map<String, ExpectedLatest> expected) {
+    int matched = 0;
+    for (Map.Entry<String, ExpectedLatest> e : expected.entrySet()) {
+      try {
+        Object payload = redisTemplate.opsForHash().entries(e.getKey()).get("payload");
+        if (payload != null && payload.toString().contains(e.getValue().msgId())) {
+          matched++;
+        }
+      } catch (Exception ignored) {
+        // Best effort counting for the timeout message only.
+      }
+    }
+    return matched;
   }
 
   private Map<String, Double> snapshotCounters() {    Map<String, Double> snap = new LinkedHashMap<>();
