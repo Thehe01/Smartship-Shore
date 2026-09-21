@@ -34,6 +34,11 @@ public class ShoreMetrics {
   private final Counter historyDuplicateTotal;
   private final Counter historyFailedTotal;
 
+  private final Counter latestStateConsumedTotal;
+  private final Counter latestStateUpdatedTotal;
+  private final Counter latestStateStaleIgnoredTotal;
+  private final Counter latestStateFailedTotal;
+
   /** P2-2: reason bucket is closed ({@code transient} / {@code poison}) — never raw values. */
   private final Map<String, Counter> historyRetryTotals = new ConcurrentHashMap<>();
   private final Map<String, Counter> historyDltTotals = new ConcurrentHashMap<>();
@@ -72,6 +77,22 @@ public class ShoreMetrics {
     this.historyFailedTotal =
         Counter.builder("smartship_shore_history_failed_total")
             .description("Failed history delivery attempts (before retry / DLT routing)")
+            .register(registry);
+    this.latestStateConsumedTotal =
+        Counter.builder("smartship_shore_latest_state_consumed_total")
+            .description("Records polled by the latest-state projection group")
+            .register(registry);
+    this.latestStateUpdatedTotal =
+        Counter.builder("smartship_shore_latest_state_updated_total")
+            .description("Latest-state hashes effectively updated in Redis")
+            .register(registry);
+    this.latestStateStaleIgnoredTotal =
+        Counter.builder("smartship_shore_latest_state_stale_ignored_total")
+            .description("Late events ignored by the Redis compare-and-set")
+            .register(registry);
+    this.latestStateFailedTotal =
+        Counter.builder("smartship_shore_latest_state_failed_total")
+            .description("Latest-state deliveries that failed (retried, then DLT)")
             .register(registry);
   }
 
@@ -149,6 +170,22 @@ public class ShoreMetrics {
   public double dltCount(String reason) {
     Counter c = historyDltTotals.get(reason);
     return c == null ? 0.0 : c.count();
+  }
+
+  public void latestStateConsumed() {
+    latestStateConsumedTotal.increment();
+  }
+
+  public void latestStateUpdated() {
+    latestStateUpdatedTotal.increment();
+  }
+
+  public void latestStateStaleIgnored() {
+    latestStateStaleIgnoredTotal.increment();
+  }
+
+  public void latestStateFailed() {
+    latestStateFailedTotal.increment();
   }
 
   /**

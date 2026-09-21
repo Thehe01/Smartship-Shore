@@ -5,6 +5,10 @@ spring:
     url: jdbc:mysql://localhost:3306/smartship_shore?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
     username: shore
     password: shore123
+  data:
+    redis:
+      host: localhost
+      port: 6379
 
 shore:
   mqtt:

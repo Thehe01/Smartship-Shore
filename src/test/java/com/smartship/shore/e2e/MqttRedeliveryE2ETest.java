@@ -25,6 +25,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -141,9 +142,16 @@ class MqttRedeliveryE2ETest {
   @Autowired
   private ShoreMetrics shoreMetrics;
 
+  @Autowired
+  private KafkaListenerEndpointRegistry listenerRegistry;
+
   @Test
   @DisplayName("Single publish → failed handoff → broker redelivers original → exactly one row")
   void originalMessageRedeliveredOnce() throws Exception {
+    // P2-3: the latest-state group has no Redis in this suite — park it so the suite
+    // stays focused on the MQTT redelivery → history chain it was built for.
+    listenerRegistry.getListenerContainer("smartship-latest-state").stop();
+
     List<Integer> ackedIds = new CopyOnWriteArrayList<>();
     ingestService.setAckListener((id, qos) -> ackedIds.add(id));
 

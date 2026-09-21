@@ -100,4 +100,17 @@ public class ShoreProperties {
     /** Fallback group id alias kept for readability in docs; same value as kafka.group-id. */
     private String groupId = "smartship-history";
   }
+
+  @Data
+  public static class Redis {
+    /**
+     * TTL (seconds) for latest-state keys, refreshed on every effective update.
+     * Stale events never touch it, so old data cannot extend a state's lifetime.
+     */
+    private long latestStateTtlSeconds = 86400L;
+    /** Consumer group projecting the raw topic into Redis latest-state hashes. */
+    private String latestStateGroupId = "smartship-latest-state";
+  }
+
+  private Redis redis = new Redis();
 }

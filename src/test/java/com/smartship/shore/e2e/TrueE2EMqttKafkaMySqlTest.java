@@ -15,6 +15,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -84,9 +85,16 @@ class TrueE2EMqttKafkaMySqlTest {
   @Autowired
   private TelemetryHistoryRepository repository;
 
+  @Autowired
+  private KafkaListenerEndpointRegistry listenerRegistry;
+
   @Test
   @DisplayName("E2E: zncb/413999999/nmea_gps → Kafka → MySQL, one row, flat data, no data.data")
   void mqttToKafkaToMysql() throws Exception {
+    // P2-3: the latest-state group has no Redis in this suite — park it so the suite
+    // stays focused on the MQTT→Kafka→MySQL chain it was built for.
+    listenerRegistry.getListenerContainer("smartship-latest-state").stop();
+
     // Gating: publish only after shore holds the subscription, otherwise the broker
     // (clean first session) has nowhere to queue the message yet.
     MqttTestSupport.waitUntil("shore subscribed", Duration.ofSeconds(60), ingestService::isReady);

@@ -28,12 +28,16 @@ Kafka Producer           key = MMSI, acks=all + 幂等
       │ key=MMSI
       ▼
 ship.telemetry.raw       (6 partitions, 单 topic)
+      │                    Kafka = 多下游事件总线，两个独立 group 各自推进 offset
+      ├─ HistoryConsumer          group = smartship-history, 手动提交 offset
+      │       │
+      │       ▼
+      │      MySQL               ship_telemetry_history, UNIQUE(msg_id) = 历史事件
       │
-      ▼
-HistoryConsumer          group = smartship-history, 手动提交 offset
-      │
-      ▼
-     MySQL               ship_telemetry_history, UNIQUE(msg_id)
+      └─ LatestStateConsumer      group = smartship-latest-state, 手动提交 offset
+              │
+              ▼
+             Redis               ship:{mmsi}:latest:{type} = 最新状态物化视图
 ```
 
 ### 为什么 MQTT 后面还需要 Kafka
@@ -45,7 +49,8 @@ HistoryConsumer          group = smartship-history, 手动提交 offset
 | 扩展 | 再加一个消费者就要再订阅一次设备流 | 加 consumer group 即可，不打扰船端 |
 
 船端只管把消息送到 Mosquitto；岸端内部谁消费、消费几次、以后加告警/实时状态，
-都由 Kafka 解耦。P2-1 只有一个消费者（HistoryConsumer），后续阶段加消费者不需要改船端。
+都由 Kafka 解耦。P2-1 只有一个消费者（HistoryConsumer），P2-3 起有两个独立 group，
+后续阶段加消费者不需要改船端。
 
 ### Kafka key 为什么用 MMSI
 
@@ -103,7 +108,34 @@ future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
 - Kafka 出站：Producer 直接序列化 `TelemetryEnvelope`（`data` 即业务 Map）。
 - Kafka 入站：Consumer 用 `objectMapper.readValue(value, TelemetryEnvelope.class)`
   直接反序列化 + 必填校验，**不再经过 flat-JSON parser**（否则 `data` 会被当成
-  普通业务字段再包一层，出现 `data.data.speed_knots`）。
+  普通业务字段再包一层，出现 `data.data.speed_knots`）。P2-3 起该契约收敛到
+  共用的 `EnvelopeCodec`，历史归档与最新状态两个 Consumer 走同一份解析/校验/序列化。
+
+### P2-3 Redis 最新状态（MySQL 存历史，Redis 存现状）
+
+- **为什么两者同时存在**：`MySQL = 历史事件`（追加写、可回放、可审计），
+  `Redis = 最新状态物化视图`（每船每类一键、可直接读），`Kafka = 多下游事件总线`
+  （两个独立 group 各自消费、各自推进 offset，互不干扰）。
+- **为什么独立 Consumer Group**：`smartship-latest-state` 与 `smartship-history`
+  消费同一 topic 但 offset/重试/DLT 完全独立；投影挂掉不影响归档，反之亦然。
+- **Key/Value**：`ship:{mmsi}:latest:{type}`（如 `ship:413999999:latest:nmea_gps`），
+  Redis Hash 存 `payload`（完整 Envelope JSON，字段与 `TelemetryEnvelope` 一致，
+  不另设 DTO）+ `ts_ms` / `sent_ms` / `msg_id` 比较字段 + TTL。
+- **为什么不能直接 SET**：at-least-once 下迟到事件会覆盖新状态。比较 + 更新必须
+  在 Redis 内原子完成，因此用 Lua（`redis/latest_state_cas.lua`）做 compare-and-set，
+  返回 `UPDATED` / `STALE`。
+- **Lua 规则**：无当前值 → 直接写；有 `timestamp` 的 incoming 覆盖无 timestamp 的当前值，
+  反之 STALE；都有则 strictly newer 写、older 丢、相等看 `msg_id`（相同即幂等重写），
+  再看 `sent_at`，最后看 `msg_id` 字典序——全确定性，无随机覆盖。STALE 照常 ACK。
+- **timestamp/null 策略**：新旧判断只用 Edge 原始 `timestamp`，不用岸端 `receivedAt`；
+  `timestamp == null` 时：无当前值可写；已有带 timestamp 的状态不允许 null 覆盖；
+  双方都无 timestamp 则按 `sent_at` 比，再按 `msg_id` 比（见 Lua 与测试矩阵）。
+- **offset 与失败语义**：`UPDATED` → ACK；`STALE` → 视为成功并 ACK；Redis 异常 →
+  不 ACK 并抛给共用的有限重试/DLT handler（与历史组同一套）。仍是 at-least-once。
+- **TTL**：`shore.redis.latest-state-ttl-seconds`（默认 86400），每次有效更新刷新；
+  STALE 不刷新，旧数据不能延长状态生命周期。
+- **Duplicate**：同 `msg_id` 重投走同一 Lua 路径，重写等价状态后正常 ACK，
+  不维护去重 Set（覆盖语义 + 时间戳/msg_id 即幂等）。
 
 ## 3. Edge MQTT 协议（以 Edge 源码为准，非自创）
 
@@ -197,7 +229,10 @@ mvn clean package
 | E2E | `TrueE2EMqttKafkaMySqlTest` | 真实 Mosquitto→岸端服务→Kafka→Consumer→MySQL；断言 row=1、`data.speed_knots=12.5`、无 `data.data`；无 Docker 跳过 |
 | E2E | `MqttRedeliveryE2ETest`（P2-1.2） | 只 publish 一次：首次 handoff 失败→不断线重投原 QoS1→恢复后恰一行，`msg_id` 不变；无 Docker 跳过 |
 | — | `HistoryRetryDltTest`（P2-2 / P2-2.1） | 正常/重复不进 DLT；失败两次第三次成功落库；持续失败耗尽后恰 1 条 DLT；毒消息/缺字段直达 DLT 零重试；DLT 失败不恢复/不计数/不提交、后续可再恢复；DLT 超时约 5s 有界；DLT 保留原 topic/key/payload/异常头 |
-| E2E | `HistoryDltTestcontainersTest`（P2-2） | 真实 Kafka+MySQL：有效 envelope 落库且 DLT 为空，毒消息进 DLT 且头完整；无 Docker 跳过 |
+| E2E | `HistoryDltTestcontainersTest`（P2-2） | 真实 Kafka+MySQL：有效 envelope 落库且 DLT 为空，毒消息进 DLT 且头完整；latest 组在该用例停掉以免同一毒消息进两次 DLT；无 Docker 跳过 |
+| — | `LatestStateConsumerTest`（P2-3） | UPDATED/STALE 均 ACK 且计数；Redis 异常不 ACK 并传播；毒消息不碰 Redis；未知脚本结果不 ACK；null timestamp 透传空串；key/ARGV 契约精确断言 |
+| E2E | `LatestStateLuaTestcontainersTest`（P2-3） | 真 Redis 上 Lua 矩阵：首次/覆盖/迟到/STALE 保值/TTL 不刷新、同 instant 与双 null 的 tiebreak、MMSI/type 隔离、重复幂等；无 Docker 跳过 |
+| E2E | `LatestStateKafkaTestcontainersTest`（P2-3） | 真 Kafka→双组扇出：MySQL 3 行 + Redis 三键值/TTL/内容正确；无 Docker 跳过 |
 
 > P2-1.1 的 `MqttKafkaHandoffReliabilityTest`（脚本重发模拟重投）已被 P2-1.2 的
 > 真实原消息重投 E2E 取代并删除：手动重发会与 broker 的真实重投竞态，断言不再可靠。
@@ -213,4 +248,6 @@ mvn clean package
 - Producer 异步发送失败（MQTT→Kafka 段）只记指标 + 日志，本阶段未加重试；
   Retry/DLT 覆盖的是 Kafka→DB 段（`HistoryConsumer`）。
 - 单 consumer（`concurrency=1`，保 partition 内顺序写库）；吞吐上限即单线程写库能力，未做 benchmark。
+- Redis 投影与历史归档是两个独立 group：同一毒消息会各自进一次 DLT（at-least-once 下各组独立处理，属正常现象，DLT 下游按原 offset/msg_id 去重）。
+- DLT 自身无去重：恢复重试可能产生多份 DLT 拷贝，下游按原 topic/offset 识别。
 - 未验证：百万 TPS、零丢失、高并发生产流量。以上均需后续真实压测数据支撑。

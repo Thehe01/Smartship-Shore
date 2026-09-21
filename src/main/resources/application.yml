@@ -20,6 +20,10 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
 
 management:
   endpoints:
@@ -57,3 +61,7 @@ shore:
     dlt-linger-ms: 0
     dlt-max-block-ms: 5000
     group-id: smartship-history
+    latest-state-group-id: smartship-latest-state
+  redis:
+    # TTL refreshed on every effective latest-state update; stale events never touch it.
+    latest-state-ttl-seconds: 86400

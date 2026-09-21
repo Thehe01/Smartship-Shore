@@ -22,6 +22,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.MySQLContainer;
@@ -74,6 +75,9 @@ class HistoryDltTestcontainersTest {
   @Autowired
   private TelemetryHistoryRepository repository;
 
+  @Autowired
+  private KafkaListenerEndpointRegistry listenerRegistry;
+
   private static String envelope(String mmsi, String type, String rowId, String eventInstant) {
     String msgId = EdgeFixtures.edgeStyleMsgId(mmsi, type, rowId, eventInstant);
     return "{\"msg_id\":\"" + msgId + "\","
@@ -114,6 +118,11 @@ class HistoryDltTestcontainersTest {
   @Test
   @DisplayName("IT: valid envelope → MySQL row, poison → DLT with original payload")
   void rawToDbAndPoisonToDlt() throws Exception {
+    // P2-3: the latest-state group would route the same poison to the DLT a second time
+    // (independent groups handle failures independently) and has no Redis here — park it
+    // so this suite asserts exactly the history group's single DLT record.
+    listenerRegistry.getListenerContainer("smartship-latest-state").stop();
+
     String validJson = envelope("413999999", "nmea_gps", "9001", "2026-09-19T02:00:00Z");
     String poisonJson = "{not-json-at-all}";
 

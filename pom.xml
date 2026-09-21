@@ -42,6 +42,12 @@
       <artifactId>spring-kafka</artifactId>
     </dependency>
 
+    <!-- Redis latest-state projection (Spring Data Redis + Lettuce) -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+
     <!-- Flyway MySQL migration -->
     <dependency>
       <groupId>org.flywaydb</groupId>

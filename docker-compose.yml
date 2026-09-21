@@ -1,6 +1,7 @@
-# P2-1 local dependencies: Kafka (KRaft, no ZooKeeper), Mosquitto, MySQL.
+# P2-1/P2-2/P2-3 local dependencies: Kafka (KRaft, no ZooKeeper), Mosquitto, MySQL, Redis.
 # Start everything with:  docker compose up -d
-# Shore connects from the host via: MQTT localhost:1883, Kafka localhost:29092, MySQL localhost:3306.
+# Shore connects from the host via: MQTT localhost:1883, Kafka localhost:29092,
+# MySQL localhost:3306, Redis localhost:6379.
 
 services:
   mysql:
@@ -56,8 +57,23 @@ services:
     volumes:
       - shore-kafka-data:/var/lib/kafka/data
 
+  redis:
+    image: redis:7-alpine
+    container_name: smartship-shore-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - shore-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
 volumes:
   shore-mysql-data:
   shore-mosquitto-data:
   shore-mosquitto-log:
   shore-kafka-data:
+  shore-redis-data:
