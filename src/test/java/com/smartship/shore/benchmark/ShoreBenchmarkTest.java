@@ -12,6 +12,7 @@ import java.nio.file.Paths;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -255,11 +256,12 @@ class ShoreBenchmarkTest {
     long lost = size - rows;
 
     // C. Per-row history latency samples (received_at - sent_at), nearest-rank.
+    // MySQL DATETIME(3) reads back as LocalDateTime while H2 reads back as
+    // Timestamp, so coerce both (same zone both sides: the delta is zone-free).
     List<Map<String, Object>> samples = jdbcTemplate.queryForList(
         "SELECT sent_at, received_at FROM ship_telemetry_history");
     double[] latencies = samples.stream()
-        .mapToDouble(r -> ((Timestamp) r.get("received_at")).getTime()
-            - ((Timestamp) r.get("sent_at")).getTime())
+        .mapToDouble(r -> toEpochMilli(r.get("received_at")) - toEpochMilli(r.get("sent_at")))
         .sorted()
         .toArray();
 
@@ -473,8 +475,28 @@ class ShoreBenchmarkTest {
     }
   }
 
-  private Map<String, Double> snapshotCounters() {
-    Map<String, Double> snap = new LinkedHashMap<>();
+  /**
+   * JDBC drivers disagree on DATETIME mapping (MySQL: LocalDateTime, H2: Timestamp).
+   * Both columns use the same conversion, so the receive-latency delta stays exact.
+   */
+  private static long toEpochMilli(Object value) {
+    if (value instanceof Timestamp ts) {
+      return ts.getTime();
+    }
+    if (value instanceof LocalDateTime ldt) {
+      return ldt.atZone(BenchmarkWorkload.EDGE_ZONE).toInstant().toEpochMilli();
+    }
+    if (value instanceof Instant instant) {
+      return instant.toEpochMilli();
+    }
+    if (value instanceof java.util.Date date) {
+      return date.getTime();
+    }
+    throw new IllegalArgumentException(
+        "unsupported datetime value: " + (value == null ? "null" : value.getClass()));
+  }
+
+  private Map<String, Double> snapshotCounters() {    Map<String, Double> snap = new LinkedHashMap<>();
     snap.put("mqtt_received_total", metrics.getMqttReceivedTotal().count());
     snap.put("mqtt_invalid_total", metrics.getMqttInvalidTotal().count());
     snap.put("kafka_produced_total", metrics.getKafkaProducedTotal().count());
