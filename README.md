@@ -237,6 +237,7 @@ mvn clean package
 | — | `LatestStateConsumerTest`（P2-3） | UPDATED/STALE 均 ACK 且计数；Redis 异常不 ACK 并传播；毒消息不碰 Redis；未知脚本结果不 ACK；null timestamp 透传空串；key/ARGV 契约精确断言 |
 | E2E | `LatestStateLuaTestcontainersTest`（P2-3 / P2-3.1） | 真 Redis 上 Lua 矩阵：首次/覆盖/迟到/STALE 保值/TTL 不刷新、同 instant 与双 null 的 tiebreak、MMSI/type 隔离、同 msg_id 重复直接 STALE 且不刷新 TTL；无 Docker 跳过 |
 | E2E | `LatestStateKafkaTestcontainersTest`（P2-3） | 真 Kafka→双组扇出：MySQL 3 行 + Redis 三键值/TTL/内容正确；无 Docker 跳过 |
+| ⚙ | `ShoreBenchmarkTest`（P2-4.1，仅 `-Pbenchmark` + Docker） | 确定性 workload 走真实全链，输出 publish/History 吞吐、History 延迟 p50/p95/p99/max、Redis 收敛、MySQL/Redis/DLT 一致性到 `target/benchmark-results/`；普通 `mvn test` 永不执行 |
 
 > P2-1.1 的 `MqttKafkaHandoffReliabilityTest`（脚本重发模拟重投）已被 P2-1.2 的
 > 真实原消息重投 E2E 取代并删除：手动重发会与 broker 的真实重投竞态，断言不再可靠。
@@ -251,7 +252,52 @@ mvn clean package
   属 P2-1 级别的简单可解释策略，精细退避留给后续阶段。
 - Producer 异步发送失败（MQTT→Kafka 段）只记指标 + 日志，本阶段未加重试；
   Retry/DLT 覆盖的是 Kafka→DB 段（`HistoryConsumer`）。
-- 单 consumer（`concurrency=1`，保 partition 内顺序写库）；吞吐上限即单线程写库能力，未做 benchmark。
+- 单 consumer（`concurrency=1`，保 partition 内顺序写库）；吞吐上限即单线程写库能力，见第 8 节基线方法（基线数据只在 Docker 实跑后落盘，不在源码里断言任何 TPS）。
 - Redis 投影与历史归档是两个独立 group：同一毒消息会各自进一次 DLT（at-least-once 下各组独立处理，属正常现象，DLT 下游按原 offset/msg_id 去重）。
 - DLT 自身无去重：恢复重试可能产生多份 DLT 拷贝，下游按原 topic/offset 识别。
 - 未验证：百万 TPS、零丢失、高并发生产流量。以上均需后续真实压测数据支撑。
+
+## 8. 基线 Benchmark（P2-4.1 方法说明）
+
+> 这是单机 Docker（GitHub/local Testcontainers）基线方法，不是生产容量证明，
+> 不是百万 TPS 测试。不得把某台机器的一次结果写成“支持 xx TPS / 生产级并发”。
+
+运行方式（默认 1000,10000,50000 三档 + 500 条 warm-up，warm-up 不计结果）：
+
+```bash
+BENCHMARK_SIZES=1000 mvn -Pbenchmark test        # smoke 单档
+BENCHMARK_SIZES=1000,10000,50000 mvn -Pbenchmark test  # 全量
+```
+
+`@Tag("benchmark")` + Maven `benchmark` profile 保证普通 `mvn test` / 普通 CI
+永不执行大规模压测；无 Docker 时 benchmark 自动 skip。
+
+- **架构**：benchmark publisher → Mosquitto → 岸端真实服务 → Kafka
+  → MySQL + Redis。全真实基础设施，禁止 mock Kafka/Redis/MySQL、禁止直调
+  `Consumer.listen()`、禁止跳过 MQTT。
+- **Workload**（`BenchmarkWorkload`，零随机）：100 个固定 MMSI
+  （`413900000`…）× 5 种真实 type 严格 round-robin；event 时间 = 固定基点 +
+  序号秒数（全局与每键递增）；`msg_id` = `SHA-256(run_id|mmsi|type|seq)`，
+  同 size 同配置业务序列相同，`run_id` 仅保证不同 run 不撞 `UNIQUE`；
+  `sent_at` 在每条 publish 前即时生成；payload 为合法 Edge 扁平 JSON。
+- **隔离**：每档独立 `run_id`；档前 `TRUNCATE` MySQL、`FLUSHDB` Redis；
+  DLT 用每档独立 group 从头消费断言为空；档前 readiness 全过才计时。
+- **Readiness**（全 bounded wait，无盲目长 sleep）：Mosquitto（岸端已订阅）、
+  Kafka（AdminClient 取到 clusterId）、MySQL/Flyway（迁移表可查）、Redis（PING）、
+  两组 partitions assigned、发布端 MQTT 建连（带限重试）。
+- **指标定义**：
+  - Publish 吞吐：第一条 publish 开始 → 最后一条 publish 返回；
+  - History 吞吐：第一条发送 → MySQL 收齐全部行；
+  - History 延迟：每行 `received_at − sent_at`（publish 侧 `sent_at` 到岸端落库，
+    应用级近似 E2E 延迟，不是 Kafka broker 内部延迟），p50/p95/p99/max；
+  - Redis：只记收敛耗时（首发 → 500 个期望 key 全部就位）+ 期望/实际 key 数 +
+    全量最终态校验 + stale 计数；**单消息 Redis 延迟本阶段不测（not measured）**，
+    不为指标改生产 Redis schema。
+- **百分位**：nearest-rank（`ceil(p/100·N)`），对真实样本排序计算；禁止均值冒充。
+- **一致性门**：MySQL 行数 == 发送数、`COUNT(DISTINCT msg_id)` 相等、重复 0；
+  Redis 键数 == 500 且每键 timestamp/msg_id 等于输入最新事件；DLT == 0；
+  `lost == sent − rows` 必须为 0；stale 必须为 0（有序基线）。
+- **输出**：`target/benchmark-results/benchmark-results.{json,csv,md}`（md 表列与
+  任务一致）+ 环境信息（时间戳、Java/OS/CPU/内存、镜像版本、配置回显）；
+  Micrometer 十个计数器按档取 after−before，避免 context 复用污染。
+- **瓶颈观察**：以 Docker 实跑数据为准，当前无实跑结论，不预设瓶颈点。
