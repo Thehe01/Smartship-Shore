@@ -24,8 +24,23 @@ jobs:
       # GitHub-hosted runners ship Docker, so every Testcontainers E2E
       # (Mosquitto / Kafka / MySQL / Redis) runs for real here: nothing
       # may be skipped or disabled to get green.
+      # A cold runner cache can hit Maven Central rate limits (HTTP 429) while
+      # resolving artifacts. That is transient infra noise, so each Maven
+      # invocation retries up to 3 times with growing backoff; every retry
+      # reuses the local repository and makes progress. A genuinely failing
+      # build or test fails all attempts and stays red: nothing is masked.
       - name: Run full test suite
-        run: mvn -B clean test
+        run: |
+          for attempt in 1 2 3; do
+            if mvn -B clean test; then
+              break
+            fi
+            echo "mvn clean test attempt $attempt failed"
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 60))
+          done
 
       - name: Summarize test results
         if: always()
@@ -65,5 +80,17 @@ jobs:
           done
           echo "All Docker E2E suites executed with 0 failures / 0 errors."
 
+      # Same transient-429 resilience as the test step above; the local
+      # repository is already warm by now, so this normally passes first try.
       - name: Package
-        run: mvn -B clean package
+        run: |
+          for attempt in 1 2 3; do
+            if mvn -B clean package; then
+              break
+            fi
+            echo "mvn clean package attempt $attempt failed"
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 60))
+          done
