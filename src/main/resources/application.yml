@@ -50,4 +50,10 @@ shore:
     raw-topic: ship.telemetry.raw
     raw-topic-partitions: 6
     dlt-topic: ship.telemetry.raw.DLT
+    # DLT producer bound: delivery.timeout.ms >= request.timeout.ms + linger.ms
+    # (5000 >= 4000 + 0); violations fail fast at startup.
+    dlt-request-timeout-ms: 4000
+    dlt-delivery-timeout-ms: 5000
+    dlt-linger-ms: 0
+    dlt-max-block-ms: 5000
     group-id: smartship-history

@@ -138,7 +138,9 @@ future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
   DLT，不做无意义重试，也不再 log+ACK 永久丢弃。DLT publish 成功后原 offset
   才推进（`commitRecovered`）。DLT publish 本身有界：`failIfSendResultIsError` +
   5s 等待（生产者 `delivery.timeout.ms` 同步 5s 上限），失败/超时则恢复失败、
-  不推进 offset、不计入 DLT 指标，后续重投继续恢复。DLT 保留：原 topic/partition/offset、key（MMSI
+  不推进 offset、不计入 DLT 指标，后续重投继续恢复。P2-2.2 收口：DLT 生产者超时
+  显式配置（`request=4000` / `delivery=5000` / `linger=0` / `max.block=5000`，
+  满足 `delivery >= request + linger`），非法组合启动即失败，不等到运行时丢 DLT。DLT 保留：原 topic/partition/offset、key（MMSI
   不变）、原始 payload、异常类型/信息/堆栈，以及 Spring 默认头之外的
   `shore-dlt-failed-at`（失败时间）与 `shore-dlt-reason`（`transient`/`poison`）。
   语义仍只是 at-least-once + 幂等，不宣称 exactly-once，更不宣称零丢失。

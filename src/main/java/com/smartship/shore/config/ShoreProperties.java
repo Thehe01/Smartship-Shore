@@ -1,5 +1,6 @@
 package com.smartship.shore.config;
 
+import jakarta.annotation.PostConstruct;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
@@ -18,6 +19,12 @@ public class ShoreProperties {
   private Mqtt mqtt = new Mqtt();
   private Kafka kafka = new Kafka();
   private History history = new History();
+
+  /** Fail-fast shape check at startup; illegal Kafka tuning stops the boot, not the data. */
+  @PostConstruct
+  public void validate() {
+    kafka.validateDltTimeouts();
+  }
 
   @Data
   public static class Mqtt {
@@ -61,8 +68,31 @@ public class ShoreProperties {
     private int rawTopicPartitions = 6;
     /** P2-2 dead-letter topic for exhausted retries and poison records. */
     private String dltTopic = "ship.telemetry.raw.DLT";
+    /**
+     * P2-2.2 DLT producer timeouts. Kafka requires
+     * {@code delivery.timeout.ms >= request.timeout.ms + linger.ms}; the defaults
+     * (5000 >= 4000 + 0) satisfy it. Any violation fails fast at startup.
+     */
+    private int dltRequestTimeoutMs = 4000;
+    private int dltDeliveryTimeoutMs = 5000;
+    private int dltLingerMs = 0;
+    private int dltMaxBlockMs = 5000;
     /** P2-1 history consumer group. */
     private String groupId = "smartship-history";
+
+    /**
+     * Fail-fast invariant for the dead-letter producer tuning. Throws
+     * {@code IllegalStateException} on violation so the application refuses to boot
+     * with an incoherent timeout triple instead of failing DLT sends at runtime.
+     */
+    public void validateDltTimeouts() {
+      if (dltDeliveryTimeoutMs < dltRequestTimeoutMs + dltLingerMs) {
+        throw new IllegalStateException(
+            "Illegal DLT producer timeouts: delivery.timeout.ms (" + dltDeliveryTimeoutMs
+                + ") must be >= request.timeout.ms (" + dltRequestTimeoutMs
+                + ") + linger.ms (" + dltLingerMs + ")");
+      }
+    }
   }
 
   @Data

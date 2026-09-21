@@ -142,6 +142,15 @@ public class KafkaConfig {
    */
   @Bean
   public KafkaTemplate<String, String> shoreDltKafkaTemplate(ShoreProperties properties) {
+    return new KafkaTemplate<>(new DefaultKafkaProducerFactory<>(dltProducerConfigs(properties)));
+  }
+
+  /**
+   * P2-2.2 DLT producer tuning in one place so config tests drive the exact production map.
+   * Invariant (fail-fast checked in {@code ShoreProperties}):
+   * {@code delivery.timeout.ms >= request.timeout.ms + linger.ms}.
+   */
+  public static Map<String, Object> dltProducerConfigs(ShoreProperties properties) {
     Map<String, Object> configs = new HashMap<>();
     configs.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
         properties.getKafka().getBootstrapServers());
@@ -155,9 +164,13 @@ public class KafkaConfig {
     // max(delivery.timeout.ms + buffer, waitForSendResultTimeout), so the producer-side
     // cap is what makes the 5s recovery bound real. A sick broker fails fast here and
     // the record is redelivered instead of parking the recovery thread.
-    configs.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 5000);
-    configs.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 5000);
-    return new KafkaTemplate<>(new DefaultKafkaProducerFactory<>(configs));
+    configs.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG,
+        properties.getKafka().getDltRequestTimeoutMs());
+    configs.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG,
+        properties.getKafka().getDltDeliveryTimeoutMs());
+    configs.put(ProducerConfig.LINGER_MS_CONFIG, properties.getKafka().getDltLingerMs());
+    configs.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, properties.getKafka().getDltMaxBlockMs());
+    return configs;
   }
 
   /**
