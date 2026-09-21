@@ -269,6 +269,9 @@ BENCHMARK_SIZES=1000 mvn -Pbenchmark test        # smoke 单档
 BENCHMARK_SIZES=1000,10000,50000 mvn -Pbenchmark test  # 全量
 ```
 
+CI 手动实跑：GitHub Actions → benchmark → Run workflow（sizes 默认 1000，
+结果进 Artifacts `benchmark-results` + Job Summary）；普通 push/PR CI 永不执行 benchmark。
+
 `@Tag("benchmark")` + Maven `benchmark` profile 保证普通 `mvn test` / 普通 CI
 永不执行大规模压测；无 Docker 时 benchmark 自动 skip。
 

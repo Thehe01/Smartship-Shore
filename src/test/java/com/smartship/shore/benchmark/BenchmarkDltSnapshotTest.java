@@ -12,6 +12,7 @@ import static org.mockito.Mockito.mock;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.Node;
@@ -22,8 +23,9 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Unit contract for the DLT snapshot helper (plain JUnit + Mockito, no broker):
- * multi-partition end offsets, partial progress, completion, the empty-topic case
- * and the bounded-timeout failure. Runs in the normal suite, not the benchmark profile.
+ * multi-partition end offsets, partial progress, completion, the empty-topic case,
+ * empty-partition failure, post-snapshot filtering and the bounded-timeout failure.
+ * Runs in the normal suite, not the benchmark profile.
  */
 @SuppressWarnings({"unchecked", "rawtypes"})
 class BenchmarkDltSnapshotTest {
@@ -98,5 +100,40 @@ class BenchmarkDltSnapshotTest {
         BenchmarkDltSnapshot.countSnapshot(
             mockConsumer(50L, 30L, 0L), "dlt", Duration.ofMillis(300)));
     assertTrue(e.getMessage().contains("timed out"));
+  }
+
+  @Test
+  @DisplayName("Empty partition list fails instead of reporting an empty DLT")
+  void emptyPartitionsFail() {
+    KafkaConsumer<String, String> consumer = mock(KafkaConsumer.class);
+    doReturn(List.of()).when(consumer).partitionsFor("dlt");
+
+    AssertionError e = assertThrows(AssertionError.class, () ->
+        BenchmarkDltSnapshot.countSnapshot(consumer, "dlt", Duration.ofSeconds(5)));
+    assertTrue(e.getMessage().contains("no partitions"),
+        "a missing topic must never look like an empty DLT");
+  }
+
+  @Test
+  @DisplayName("Records appended after the snapshot end do not count")
+  void postSnapshotRecordsExcluded() {
+    KafkaConsumer<String, String> consumer = mock(KafkaConsumer.class);
+    Node node = new Node(0, "mock", 9092);
+    doReturn(List.of(new PartitionInfo("dlt", 0, node, new Node[] {node}, new Node[] {node})))
+        .when(consumer).partitionsFor("dlt");
+    TopicPartition tp = new TopicPartition("dlt", 0);
+    doReturn(Map.of(tp, 2L)).when(consumer).endOffsets(anyCollection());
+    // Position already past the end (later appends visible), but only offsets 0-1
+    // belong to the captured snapshot.
+    doReturn(4L).when(consumer).position(tp);
+    Map<TopicPartition, List<ConsumerRecord<String, String>>> data = Map.of(tp, List.of(
+        new ConsumerRecord<>("dlt", 0, 0L, "k", "v0"),
+        new ConsumerRecord<>("dlt", 0, 1L, "k", "v1"),
+        new ConsumerRecord<>("dlt", 0, 2L, "k", "v2-post"),
+        new ConsumerRecord<>("dlt", 0, 3L, "k", "v3-post")));
+    doReturn(new ConsumerRecords<String, String>(data))
+        .when(consumer).poll(any(Duration.class));
+
+    assertEquals(2L, BenchmarkDltSnapshot.countSnapshot(consumer, "dlt", Duration.ofSeconds(5)));
   }
 }

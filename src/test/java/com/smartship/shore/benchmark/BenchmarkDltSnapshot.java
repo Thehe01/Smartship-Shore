@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
@@ -38,17 +39,29 @@ public final class BenchmarkDltSnapshot {
   /**
    * Counts every record in the topic snapshot visible right now.
    *
+   * <p>Two strictness rules keep a {@code 0} verdict honest:
+   * <ul>
+   *   <li>an empty partition list fails instead of returning {@code 0}, so a missing
+   *   topic can never be confused with an empty DLT;</li>
+   *   <li>only records with {@code offset < captured end} count: anything appended
+   *   after the snapshot was pinned belongs to a later world, not to this verdict.</li>
+   * </ul>
+   *
    * @param consumer plain consumer (ownership stays with the caller)
    * @param topic DLT topic name
    * @param timeout upper bound for reaching the snapshot end
    * @return exact record count inside the captured snapshot
-   * @throws AssertionError when the snapshot end is not reached in time
+   * @throws AssertionError when the topic has no partitions or the snapshot end
+   *     is not reached in time
    */
   public static long countSnapshot(KafkaConsumer<String, String> consumer, String topic,
       Duration timeout) {
     List<TopicPartition> partitions = new ArrayList<>();
     consumer.partitionsFor(topic).forEach(info ->
         partitions.add(new TopicPartition(topic, info.partition())));
+    if (partitions.isEmpty()) {
+      throw new AssertionError("DLT topic has no partitions (missing topic?): " + topic);
+    }
     consumer.assign(partitions);
     consumer.seekToBeginning(partitions);
     Map<TopicPartition, Long> endOffsets = new LinkedHashMap<>(consumer.endOffsets(partitions));
@@ -58,8 +71,13 @@ public final class BenchmarkDltSnapshot {
     long deadline = System.nanoTime() + timeout.toNanos();
     while (true) {
       ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
-      total += records.count();
       for (TopicPartition tp : partitions) {
+        long end = endOffsets.getOrDefault(tp, 0L);
+        for (ConsumerRecord<String, String> record : records.records(tp)) {
+          if (record.offset() < end) {
+            total++;
+          }
+        }
         positions.put(tp, consumer.position(tp));
       }
       if (reachedSnapshotEnd(endOffsets, positions)) {

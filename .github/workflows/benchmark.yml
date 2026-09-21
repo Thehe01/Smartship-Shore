@@ -1,0 +1,51 @@
+name: benchmark
+
+# Manual baseline runs only. Never triggered by push/PR and never part of the
+# normal CI: deterministic workload against real Docker infrastructure via
+# Testcontainers, results uploaded as artifacts. Re-dispatch manually on
+# transient infrastructure flakes (e.g. Maven Central 429 on a cold cache).
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: 'Benchmark sizes, comma-separated (e.g. 1000 or 1000,10000,50000)'
+        required: false
+        default: '1000'
+        type: string
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # The benchmark Maven profile runs ONLY @Tag("benchmark") tests; the
+      # plain suite stays untouched by this job.
+      - name: Run baseline benchmark
+        run: BENCHMARK_SIZES='${{ inputs.sizes }}' mvn -B -Pbenchmark test
+
+      - name: Publish results to job summary
+        if: always()
+        run: |
+          if [ ! -f target/benchmark-results/benchmark-results.md ]; then
+            echo "FAIL: no benchmark results produced"
+            exit 1
+          fi
+          cat target/benchmark-results/benchmark-results.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: target/benchmark-results/
+          if-no-files-found: error
