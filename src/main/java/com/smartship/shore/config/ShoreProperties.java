@@ -79,6 +79,8 @@ public class ShoreProperties {
     private int dltMaxBlockMs = 5000;
     /** P2-1 history consumer group. */
     private String groupId = "smartship-history";
+    /** P2-3 consumer group projecting the raw topic into Redis latest-state hashes. */
+    private String latestStateGroupId = "smartship-latest-state";
 
     /**
      * Fail-fast invariant for the dead-letter producer tuning. Throws
@@ -103,7 +105,5 @@ public class ShoreProperties {
      * extend a state's lifetime.
      */
     private long latestStateTtlSeconds = 86400L;
-    /** Consumer group projecting the raw topic into Redis latest-state hashes. */
-    private String latestStateGroupId = "smartship-latest-state";
   }
 }

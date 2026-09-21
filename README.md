@@ -1,10 +1,10 @@
 # Smartship-Shore
 
-岸端事件处理系统 **P2-1 / P2-1.1 / P2-1.2 / P2-2**：`MQTT → Kafka → DB`
-最小可靠链路 + 消费端有限重试与死信（单体 Spring Boot，不拆微服务）。
+岸端事件处理系统 **P2-1 → P2-2 → P2-3**：`MQTT → Kafka → MySQL 历史归档`
++ `Kafka → Redis 最新状态`（单体 Spring Boot，不拆微服务）。
 
-> 本阶段只做 `MQTT → Kafka → MySQL（含 Retry/DLT）`。Redis、WebSocket、
-> Elasticsearch、告警、微服务拆分均为后续阶段，当前代码不包含。
+> 本阶段只做 `MQTT → Kafka → MySQL（含 Retry/DLT）` 与 `Kafka → Redis 最新状态投影`。
+> WebSocket、Elasticsearch、告警、微服务拆分均为后续阶段，当前代码不包含。
 
 ## 1. 项目定位
 
@@ -118,6 +118,8 @@ future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
   （两个独立 group 各自消费、各自推进 offset，互不干扰）。
 - **为什么独立 Consumer Group**：`smartship-latest-state` 与 `smartship-history`
   消费同一 topic 但 offset/重试/DLT 完全独立；投影挂掉不影响归档，反之亦然。
+  配置路径统一在 `shore.kafka` 下：`group-id`（历史组）与
+  `latest-state-group-id`（投影组），见 `application.yml`。
 - **Key/Value**：`ship:{mmsi}:latest:{type}`（如 `ship:413999999:latest:nmea_gps`），
   Redis Hash 存 `payload`（完整 Envelope JSON，字段与 `TelemetryEnvelope` 一致，
   不另设 DTO）+ `ts_ms` / `sent_ms` / `msg_id` 比较字段 + TTL。
