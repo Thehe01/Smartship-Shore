@@ -163,8 +163,10 @@ class ShoreBenchmarkTest {
     BenchmarkReport report = BenchmarkReport.create(config);
     report.notes.add("Warm-up (500 messages) is excluded from every result below.");
     report.notes.add("Percentiles use nearest-rank over real per-row samples.");
-    report.notes.add("history_latency = received_at - sent_at: MQTT publish-side sent_at to"
-        + " shore persistence; an application-level approximation, not a Kafka-internal latency.");
+    report.notes.add("History P50/P95/P99 are RECEIVE latencies: publish-side sent_at to"
+        + " HistoryConsumer receive/processing timestamp; they exclude per-row MySQL"
+        + " insert/commit time and are not Kafka broker latencies. Batch persistence"
+        + " convergence is measured by history completion/throughput instead.");
     report.notes.add("Redis per-message latency is not measured in P2-4.1: latest-state"
         + " projection keeps no per-message consume time.");
     report.notes.add("Single-machine Docker/Testcontainers baseline only: not a production"
@@ -301,10 +303,11 @@ class ShoreBenchmarkTest {
     r.publishThroughputMsgS = size * 1000.0 / Math.max(r.publishDurationMs, 1);
     r.historyCompletionMs = (historyDone - firstSendStart) / 1_000_000;
     r.historyThroughputMsgS = size * 1000.0 / Math.max(r.historyCompletionMs, 1);
-    r.historyLatencyP50Ms = BenchmarkResult.percentile(latencies, 50);
-    r.historyLatencyP95Ms = BenchmarkResult.percentile(latencies, 95);
-    r.historyLatencyP99Ms = BenchmarkResult.percentile(latencies, 99);
-    r.historyLatencyMaxMs = latencies.length == 0 ? Double.NaN : latencies[latencies.length - 1];
+    r.historyReceiveLatencyP50Ms = BenchmarkResult.percentile(latencies, 50);
+    r.historyReceiveLatencyP95Ms = BenchmarkResult.percentile(latencies, 95);
+    r.historyReceiveLatencyP99Ms = BenchmarkResult.percentile(latencies, 99);
+    r.historyReceiveLatencyMaxMs =
+        latencies.length == 0 ? Double.NaN : latencies[latencies.length - 1];
     r.redisCompletionMs = (redisDone - firstSendStart) / 1_000_000;
     r.redisExpectedKeys = expected.size();
     r.redisActualKeys = (int) actualKeys;
@@ -451,29 +454,23 @@ class ShoreBenchmarkTest {
     }
   }
 
-  /** DLT records visible from the beginning of time (fresh group per case). */
+  /**
+   * Exact DLT record count inside the snapshot visible right now. A fresh group per
+   * case plus assign/seek-to-beginning/end-offset reading (see
+   * {@link BenchmarkDltSnapshot}) makes this deterministic: an empty first poll can
+   * no longer fake an empty DLT while assignment is still in flight.
+   */
   private long countDltSinceBeginning(String runId) {
     Properties props = new Properties();
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
     props.put(ConsumerConfig.GROUP_ID_CONFIG, "bench-dlt-" + runId);
     props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
     props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-    props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
     props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
-    long total = 0;
     try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
-      consumer.subscribe(List.of(properties.getKafka().getDltTopic()));
-      long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-      while (System.nanoTime() <= deadline) {
-        var records = consumer.poll(Duration.ofSeconds(1));
-        total += records.count();
-        if (records.count() == 0) {
-          // One quiet second after having polled: treat the DLT as drained.
-          break;
-        }
-      }
+      return BenchmarkDltSnapshot.countSnapshot(
+          consumer, properties.getKafka().getDltTopic(), Duration.ofSeconds(30));
     }
-    return total;
   }
 
   private Map<String, Double> snapshotCounters() {

@@ -74,8 +74,9 @@ public class BenchmarkReport {
     StringBuilder sb = new StringBuilder(
         "messages,mmsi_count,type_count,publish_duration_ms,publish_throughput_msg_s,"
             + "history_completion_ms,history_throughput_msg_s,"
-            + "history_latency_p50_ms,history_latency_p95_ms,history_latency_p99_ms,"
-            + "history_latency_max_ms,redis_completion_ms,redis_expected_keys,"
+            + "history_receive_latency_p50_ms,history_receive_latency_p95_ms,"
+            + "history_receive_latency_p99_ms,history_receive_latency_max_ms,"
+            + "redis_completion_ms,redis_expected_keys,"
             + "redis_actual_keys,mysql_rows,distinct_msg_ids,dlt_records,lost_messages\n");
     for (BenchmarkResult r : results) {
       sb.append(r.messages).append(',')
@@ -85,10 +86,10 @@ public class BenchmarkReport {
           .append(fmt(r.publishThroughputMsgS)).append(',')
           .append(r.historyCompletionMs).append(',')
           .append(fmt(r.historyThroughputMsgS)).append(',')
-          .append(fmt(r.historyLatencyP50Ms)).append(',')
-          .append(fmt(r.historyLatencyP95Ms)).append(',')
-          .append(fmt(r.historyLatencyP99Ms)).append(',')
-          .append(fmt(r.historyLatencyMaxMs)).append(',')
+          .append(fmt(r.historyReceiveLatencyP50Ms)).append(',')
+          .append(fmt(r.historyReceiveLatencyP95Ms)).append(',')
+          .append(fmt(r.historyReceiveLatencyP99Ms)).append(',')
+          .append(fmt(r.historyReceiveLatencyMaxMs)).append(',')
           .append(r.redisCompletionMs).append(',')
           .append(r.redisExpectedKeys).append(',')
           .append(r.redisActualKeys).append(',')
@@ -115,9 +116,9 @@ public class BenchmarkReport {
       sb.append("| ").append(r.messages)
           .append(" | ").append(fmt(r.publishThroughputMsgS))
           .append(" | ").append(fmt(r.historyThroughputMsgS))
-          .append(" | ").append(fmt(r.historyLatencyP50Ms))
-          .append(" | ").append(fmt(r.historyLatencyP95Ms))
-          .append(" | ").append(fmt(r.historyLatencyP99Ms))
+          .append(" | ").append(fmt(r.historyReceiveLatencyP50Ms))
+          .append(" | ").append(fmt(r.historyReceiveLatencyP95Ms))
+          .append(" | ").append(fmt(r.historyReceiveLatencyP99Ms))
           .append(" | ").append(r.redisCompletionMs)
           .append(" | ").append(r.mysqlRows)
           .append(" | ").append(r.redisActualKeys).append('/').append(r.redisExpectedKeys)

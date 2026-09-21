@@ -9,12 +9,15 @@ import java.util.Map;
  * <p>Clock definitions:
  * <ul>
  *   <li>publish window: first MQTT publish start → last MQTT publish return;</li>
- *   <li>history completion: first send → MySQL holding every row;</li>
+ *   <li>history completion: first send → MySQL holding every row (this, not latency,
+ *   measures full batch persistence convergence);</li>
  *   <li>redis converge: first send → every expected latest key holding its final event;</li>
- *   <li>history latency per row: {@code received_at - sent_at}, where {@code sent_at} is
- *   stamped at MQTT publish time and {@code received_at} at history persistence — an
- *   application-level approximation of end-to-end latency through MQTT + Kafka + MySQL,
- *   NOT a Kafka broker-internal latency.</li>
+ *   <li>history <b>receive</b> latency per row: {@code received_at - sent_at}, where
+ *   {@code sent_at} is stamped at MQTT publish time and {@code received_at} is the
+ *   timestamp {@code HistoryConsumer} takes just before building the persistence
+ *   entity. It therefore covers publish-side send → consumer receive/processing and
+ *   explicitly does <b>not</b> include the per-row MySQL insert/commit completion,
+ *   and it is <b>not</b> a Kafka broker-internal latency.</li>
  * </ul>
  * Percentiles use nearest-rank over the real per-row samples (see README).
  */
@@ -31,10 +34,10 @@ public class BenchmarkResult {
   public long historyCompletionMs;
   public double historyThroughputMsgS;
 
-  public double historyLatencyP50Ms;
-  public double historyLatencyP95Ms;
-  public double historyLatencyP99Ms;
-  public double historyLatencyMaxMs;
+  public double historyReceiveLatencyP50Ms;
+  public double historyReceiveLatencyP95Ms;
+  public double historyReceiveLatencyP99Ms;
+  public double historyReceiveLatencyMaxMs;
 
   public long redisCompletionMs;
   public int redisExpectedKeys;

@@ -281,15 +281,19 @@ BENCHMARK_SIZES=1000,10000,50000 mvn -Pbenchmark test  # 全量
   同 size 同配置业务序列相同，`run_id` 仅保证不同 run 不撞 `UNIQUE`；
   `sent_at` 在每条 publish 前即时生成；payload 为合法 Edge 扁平 JSON。
 - **隔离**：每档独立 `run_id`；档前 `TRUNCATE` MySQL、`FLUSHDB` Redis；
-  DLT 用每档独立 group 从头消费断言为空；档前 readiness 全过才计时。
+  DLT 用 assign + seekToBeginning + captured endOffsets 读取完整 snapshot 后断言
+  为空（禁止 subscribe 后空 poll 即判空，禁止固定 sleep 猜 drained，只查单分区）；
+  档前 readiness 全过才计时。
 - **Readiness**（全 bounded wait，无盲目长 sleep）：Mosquitto（岸端已订阅）、
   Kafka（AdminClient 取到 clusterId）、MySQL/Flyway（迁移表可查）、Redis（PING）、
   两组 partitions assigned、发布端 MQTT 建连（带限重试）。
 - **指标定义**：
   - Publish 吞吐：第一条 publish 开始 → 最后一条 publish 返回；
-  - History 吞吐：第一条发送 → MySQL 收齐全部行；
-  - History 延迟：每行 `received_at − sent_at`（publish 侧 `sent_at` 到岸端落库，
-    应用级近似 E2E 延迟，不是 Kafka broker 内部延迟），p50/p95/p99/max；
+  - History 吞吐（整批落库收敛）：第一条发送 → MySQL 收齐全部行；
+  - History receive 延迟：每行 `received_at − sent_at`，即 publish 侧 `sent_at` →
+    `HistoryConsumer` 构造持久化实体前的接收/处理时间戳，p50/p95/p99/max。
+    明确声明：**不包含单条 MySQL insert/commit 完成时间，不是 Kafka broker
+    延迟**（整批落库收敛由 History 吞吐衡量）；
   - Redis：只记收敛耗时（首发 → 500 个期望 key 全部就位）+ 期望/实际 key 数 +
     全量最终态校验 + stale 计数；**单消息 Redis 延迟本阶段不测（not measured）**，
     不为指标改生产 Redis schema。
