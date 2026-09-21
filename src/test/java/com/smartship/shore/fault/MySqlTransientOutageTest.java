@@ -174,10 +174,12 @@ class MySqlTransientOutageTest {
           TOPIC, edgePayload());
 
       // Failure proof while the outage is still on: the record entered
-      // transient retry, and MySQL holds nothing yet.
+      // transient retry, and nothing persisted yet. The check deliberately
+      // reads Micrometer counters, never the paused MySQL itself.
       MqttTestSupport.waitUntil("transient retry during outage", Duration.ofSeconds(90),
           () -> metrics.retryCount("transient") > retryBefore);
-      assertEquals(0L, repository.countAll(), "no history row while MySQL is down");
+      assertEquals(0.0, metrics.getHistoryPersistedTotal().count() - persistedBefore,
+          "history must not persist while MySQL is paused");
 
       // The LatestState group shares nothing with MySQL: it must project
       // the same message while the outage is still on.
