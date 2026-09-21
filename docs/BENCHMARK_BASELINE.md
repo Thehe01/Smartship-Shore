@@ -19,12 +19,11 @@
 | Messages | Publish msg/s | History msg/s | P50 ms | P95 ms | P99 ms | Redis converge ms | MySQL rows | Redis keys | DLT | Lost | Harness commit | Run |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
 | 1000 | 1769.91 | 245.10 | 2119 | 3001 | 3064 | 4242 | 1000/1000 | 500/500 | 0 | 0 | `d9cb088` | [Run 35618393537](https://github.com/Thehe01/Smartship-Shore/actions/runs/35618393537) |
-| 10000 | 2435.46 | 360.46 | 17431 | 22971 | 23347 | 27910 | 10000/10000 | 500/500 | 0 | 0 | `e5b5f1c` | 见 Artifacts `benchmark-results` |
-| 50000 | 3078.63 | 465.70 | 54784 | 87159 | 90397 | 107745 | 50000/50000 | 500/500 | 0 | 0 | `e5b5f1c` | 见 Artifacts `benchmark-results` |
+| 10000 | 2435.46 | 360.46 | 17431 | 22971 | 23347 | 27910 | 10000/10000 | 500/500 | 0 | 0 | `e5b5f1c` | [Run 35622631909](https://github.com/Thehe01/Smartship-Shore/actions/runs/35622631909) |
+| 50000 | 3078.63 | 465.70 | 54784 | 87159 | 90397 | 107745 | 50000/50000 | 500/500 | 0 | 0 | `e5b5f1c` | [Run 35623305798](https://github.com/Thehe01/Smartship-Shore/actions/runs/35623305798) |
 
 - 三档一致性门全过：行数 == 发送数、`DISTINCT msg_id` 相等、Redis 每键
   timestamp/msg_id 等于输入最新事件、stale == 0、DLT == 0、lost == 0
-- 10k/50k 的 run URL 待补（结果表已逐字归档自对应 `benchmark-results.md`）
 
 ## 形状（读数，不做优化断言）
 
