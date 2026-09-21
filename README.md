@@ -21,7 +21,7 @@ Smartship Edge
   Mosquitto
       │
       ▼
-MqttIngestService        解析 + 校验 → Kafka(异步) → 成功才 ACK MQTT
+MqttIngestService        解析 + 校验 → Kafka(有界同步交接) → 成功才 ACK MQTT
       │
       ▼
 Kafka Producer           key = MMSI, acks=all + 幂等
@@ -124,9 +124,11 @@ future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
 - **为什么不能直接 SET**：at-least-once 下迟到事件会覆盖新状态。比较 + 更新必须
   在 Redis 内原子完成，因此用 Lua（`redis/latest_state_cas.lua`）做 compare-and-set，
   返回 `UPDATED` / `STALE`。
-- **Lua 规则**：无当前值 → 直接写；有 `timestamp` 的 incoming 覆盖无 timestamp 的当前值，
-  反之 STALE；都有则 strictly newer 写、older 丢、相等看 `msg_id`（相同即幂等重写），
-  再看 `sent_at`，最后看 `msg_id` 字典序——全确定性，无随机覆盖。STALE 照常 ACK。
+- **Lua 规则**：无当前值 → 直接写；`msg_id` 相同即重复投递 → 直接 STALE
+  （状态与 TTL 都不动，offset 照常推进）；有 `timestamp` 的 incoming 覆盖无
+  timestamp 的当前值，反之 STALE；都有则 strictly newer 写、older 丢；时间相等
+  且 `msg_id` 不同时看 `sent_at` 大者，最后看 `msg_id` 字典序——全确定性，
+  无随机覆盖。STALE 照常 ACK。
 - **timestamp/null 策略**：新旧判断只用 Edge 原始 `timestamp`，不用岸端 `receivedAt`；
   `timestamp == null` 时：无当前值可写；已有带 timestamp 的状态不允许 null 覆盖；
   双方都无 timestamp 则按 `sent_at` 比，再按 `msg_id` 比（见 Lua 与测试矩阵）。
@@ -134,8 +136,8 @@ future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
   不 ACK 并抛给共用的有限重试/DLT handler（与历史组同一套）。仍是 at-least-once。
 - **TTL**：`shore.redis.latest-state-ttl-seconds`（默认 86400），每次有效更新刷新；
   STALE 不刷新，旧数据不能延长状态生命周期。
-- **Duplicate**：同 `msg_id` 重投走同一 Lua 路径，重写等价状态后正常 ACK，
-  不维护去重 Set（覆盖语义 + 时间戳/msg_id 即幂等）。
+- **Duplicate**：同 `msg_id` 重投直接 STALE（状态不变、TTL 不刷新）后正常 ACK，
+  不维护去重 Set（`msg_id` 本身即幂等键）。
 
 ## 3. Edge MQTT 协议（以 Edge 源码为准，非自创）
 
@@ -231,7 +233,7 @@ mvn clean package
 | — | `HistoryRetryDltTest`（P2-2 / P2-2.1） | 正常/重复不进 DLT；失败两次第三次成功落库；持续失败耗尽后恰 1 条 DLT；毒消息/缺字段直达 DLT 零重试；DLT 失败不恢复/不计数/不提交、后续可再恢复；DLT 超时约 5s 有界；DLT 保留原 topic/key/payload/异常头 |
 | E2E | `HistoryDltTestcontainersTest`（P2-2） | 真实 Kafka+MySQL：有效 envelope 落库且 DLT 为空，毒消息进 DLT 且头完整；latest 组在该用例停掉以免同一毒消息进两次 DLT；无 Docker 跳过 |
 | — | `LatestStateConsumerTest`（P2-3） | UPDATED/STALE 均 ACK 且计数；Redis 异常不 ACK 并传播；毒消息不碰 Redis；未知脚本结果不 ACK；null timestamp 透传空串；key/ARGV 契约精确断言 |
-| E2E | `LatestStateLuaTestcontainersTest`（P2-3） | 真 Redis 上 Lua 矩阵：首次/覆盖/迟到/STALE 保值/TTL 不刷新、同 instant 与双 null 的 tiebreak、MMSI/type 隔离、重复幂等；无 Docker 跳过 |
+| E2E | `LatestStateLuaTestcontainersTest`（P2-3 / P2-3.1） | 真 Redis 上 Lua 矩阵：首次/覆盖/迟到/STALE 保值/TTL 不刷新、同 instant 与双 null 的 tiebreak、MMSI/type 隔离、同 msg_id 重复直接 STALE 且不刷新 TTL；无 Docker 跳过 |
 | E2E | `LatestStateKafkaTestcontainersTest`（P2-3） | 真 Kafka→双组扇出：MySQL 3 行 + Redis 三键值/TTL/内容正确；无 Docker 跳过 |
 
 > P2-1.1 的 `MqttKafkaHandoffReliabilityTest`（脚本重发模拟重投）已被 P2-1.2 的

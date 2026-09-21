@@ -152,16 +152,18 @@ class LatestStateLuaTestcontainersTest {
   }
 
   @Test
-  @DisplayName("Equal timestamps: same msg_id idempotent, newer sent_at wins, older loses")
+  @DisplayName("Equal timestamps: duplicate is stale, newer sent_at wins, older loses")
   void equalTimestampTiebreaks() throws Exception {
     String mmsi = "413900002";
     String type = "nmea_gps";
     String k = key(mmsi, type);
     Instant t = Instant.parse("2026-09-19T02:05:00Z");
+    double updatedBefore = metrics.getLatestStateUpdatedTotal().count();
+    double staleBefore = metrics.getLatestStateStaleIgnoredTotal().count();
 
     String same = envelopeJson(mmsi, type, "same", t, t.plusSeconds(5), Map.of("speed_knots", 10.0));
     listen(mmsi, same);
-    listen(mmsi, same); // same msg_id redelivery: idempotent success
+    listen(mmsi, same); // same msg_id redelivery: stale, state and TTL untouched
     assertEquals(t.toString(), payloadTs(k));
 
     // Different msg_id, same instant, newer sent_at → wins.
@@ -175,6 +177,9 @@ class LatestStateLuaTestcontainersTest {
     assertEquals(11.0,
         objectMapper.readTree(String.valueOf(hash(k).get("payload")))
             .path("data").path("speed_knots").asDouble(), 1e-9);
+
+    assertEquals(2.0, metrics.getLatestStateUpdatedTotal().count() - updatedBefore);
+    assertEquals(2.0, metrics.getLatestStateStaleIgnoredTotal().count() - staleBefore);
   }
 
   @Test
@@ -235,19 +240,29 @@ class LatestStateLuaTestcontainersTest {
   }
 
   @Test
-  @DisplayName("Duplicate redelivery leaves an equivalent state and ACKs")
+  @DisplayName("Duplicate redelivery keeps state and TTL untouched, still ACKs")
   void duplicateRedelivery() throws Exception {
     String mmsi = "413900007";
     String k = key(mmsi, "nmea_gps");
     Instant t = Instant.parse("2026-09-19T02:05:00Z");
     String json = envelopeJson(mmsi, "nmea_gps", "dup", t, t.plusSeconds(5),
         Map.of("speed_knots", 12.5));
+    double staleBefore = metrics.getLatestStateStaleIgnoredTotal().count();
 
     listen(mmsi, json);
     String first = String.valueOf(hash(k).get("payload"));
-    listen(mmsi, json);
+    Long ttlAfterFirst = ttl(k);
+    assertTrue(ttlAfterFirst != null && ttlAfterFirst > 0);
+
+    Thread.sleep(2200); // let the clock move so a TTL refresh would be visible
+    listen(mmsi, json); // same msg_id: stale, must not refresh anything
 
     assertEquals(objectMapper.readTree(first),
-        objectMapper.readTree(String.valueOf(hash(k).get("payload"))));
+        objectMapper.readTree(String.valueOf(hash(k).get("payload"))),
+        "duplicate must leave the stored state untouched");
+    Long ttlAfterDuplicate = ttl(k);
+    assertTrue(ttlAfterDuplicate != null && ttlAfterDuplicate < ttlAfterFirst,
+        "duplicate must not refresh TTL");
+    assertEquals(1.0, metrics.getLatestStateStaleIgnoredTotal().count() - staleBefore);
   }
 }

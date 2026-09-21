@@ -53,6 +53,12 @@ end
 if cmid == nil then
   return write()
 end
+-- Same deterministic msg_id: the business content is identical, so this is a pure
+-- duplicate redelivery — keep the stored state untouched and do NOT refresh the TTL.
+-- Reported as STALE (ignored, but still a successful offset advance).
+if imid == cmid then
+  return 'STALE'
+end
 -- A real event time beats an unknown one, and never the reverse.
 if its ~= nil and cts == nil then
   return write()
@@ -69,12 +75,9 @@ if its ~= nil and cts ~= nil then
     return 'STALE'
   end
 end
--- Equal event times (including both absent): same msg_id is an idempotent
--- rewrite; otherwise the newer sent_at wins; then the greater msg_id wins.
--- Fully deterministic — no random last-writer behavior.
-if imid == cmid then
-  return write()
-end
+-- Equal event times (including both absent) with different msg_id: the newer
+-- sent_at wins; then the greater msg_id wins. Fully deterministic — no random
+-- last-writer behavior.
 local s_i = missing(iss)
 local s_c = missing(css)
 if s_i > s_c then

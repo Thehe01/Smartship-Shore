@@ -88,7 +88,8 @@ public class ShoreMetrics {
             .register(registry);
     this.latestStateStaleIgnoredTotal =
         Counter.builder("smartship_shore_latest_state_stale_ignored_total")
-            .description("Late events ignored by the Redis compare-and-set")
+            .description("Late events and duplicate redeliveries ignored by the Redis"
+                + " compare-and-set (state and TTL untouched, offset still advances)")
             .register(registry);
     this.latestStateFailedTotal =
         Counter.builder("smartship_shore_latest_state_failed_total")
