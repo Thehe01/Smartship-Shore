@@ -307,4 +307,6 @@ CI 手动实跑：GitHub Actions → benchmark → Run workflow（sizes 默认 1
 - **输出**：`target/benchmark-results/benchmark-results.{json,csv,md}`（md 表列与
   任务一致）+ 环境信息（时间戳、Java/OS/CPU/内存、镜像版本、配置回显）；
   Micrometer 十个计数器按档取 after−before，避免 context 复用污染。
-- **瓶颈观察**：以 Docker 实跑数据为准，当前无实跑结论，不预设瓶颈点。
+- **瓶颈观察**：首批 Docker 实跑数据已落盘，见 `docs/BENCHMARK_BASELINE.md`
+  （1k/10k/50k 三档全绿，零丢失零 DLT；延迟随 burst 线性涨符合串行 handoff +
+  单线程消费形状）。优化不断言，以后续实跑为准。
