@@ -26,6 +26,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
 import org.eclipse.paho.client.mqttv3.MqttClient;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
@@ -75,6 +76,7 @@ import org.testcontainers.utility.MountableFile;
 class ShoreBenchmarkTest {
 
   private static final int WARMUP_MESSAGES = 500;
+  private static final int PUBLISH_WINDOW = 200;
   private static final String DEFAULT_SIZES = "1000,10000,50000";
 
   @Container
@@ -220,10 +222,17 @@ class ShoreBenchmarkTest {
     options.setCleanSession(true);
     options.setConnectionTimeout(10);
     options.setAutomaticReconnect(false);
+    // Paho defaults maxInflight to 10: a tight QoS1 loop over 1k+ messages would
+    // hit "Too many publishes in progress" before the broker PUBACKs drain.
+    // Bounded-inflight publishing below keeps at most PUBLISH_WINDOW unacked.
+    options.setMaxInflight(500);
     connectWithRetry(publisher, options);
 
-    // A. Publish throughput: first publish start -> last publish return.
+    // A. Publish throughput: first publish start -> last publish return (includes
+    // bounded PUBACK drains, so this is sustainable publish throughput, not
+    // fire-and-forget enqueue rate).
     long firstSendStart = System.nanoTime();
+    int published = 0;
     try {
       for (BenchmarkWorkload.Spec spec : workload) {
         Instant sentAt = Instant.now();
@@ -231,6 +240,14 @@ class ShoreBenchmarkTest {
         MqttMessage message = new MqttMessage(json.getBytes(StandardCharsets.UTF_8));
         message.setQos(1);
         publisher.publish(spec.topic(), message);
+        if (++published % PUBLISH_WINDOW == 0) {
+          for (IMqttDeliveryToken token : publisher.getPendingDeliveryTokens()) {
+            token.waitForCompletion(30_000);
+          }
+        }
+      }
+      for (IMqttDeliveryToken token : publisher.getPendingDeliveryTokens()) {
+        token.waitForCompletion(30_000);
       }
     } finally {
       try {
