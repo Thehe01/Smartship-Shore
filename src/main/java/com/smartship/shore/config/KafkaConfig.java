@@ -5,6 +5,7 @@ import com.smartship.shore.ingest.InvalidTelemetryException;
 import com.smartship.shore.model.TelemetryEnvelope;
 import com.smartship.shore.observability.ShoreMetrics;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
@@ -150,6 +151,12 @@ public class KafkaConfig {
     configs.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
     configs.put(ProducerConfig.RETRIES_CONFIG, 5);
     configs.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+    // P2-2.1: bound the DLT send itself — Spring waits
+    // max(delivery.timeout.ms + buffer, waitForSendResultTimeout), so the producer-side
+    // cap is what makes the 5s recovery bound real. A sick broker fails fast here and
+    // the record is redelivered instead of parking the recovery thread.
+    configs.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 5000);
+    configs.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 5000);
     return new KafkaTemplate<>(new DefaultKafkaProducerFactory<>(configs));
   }
 
@@ -169,6 +176,15 @@ public class KafkaConfig {
       KafkaTemplate<String, String> dltTemplate, ShoreMetrics metrics) {
     DeadLetterPublishingRecoverer recoverer =
         new DeadLetterPublishingRecoverer(dltTemplate);
+    // P2-2.1 DLT publish safety: a failed or timed-out DLT send must surface as a
+    // recovery failure (offset stays put, redelivery/recovery continues) instead of
+    // silently passing with commitRecovered=true advancing the original offset.
+    // The wait is bounded — never an infinite join on the send future. Note the
+    // effective wait is max(delivery.timeout.ms + buffer, this timeout): with the
+    // producer capped at 5s and a zero buffer the recovery bound is exactly 5s.
+    recoverer.setFailIfSendResultIsError(true);
+    recoverer.setWaitForSendResultTimeout(Duration.ofSeconds(5));
+    recoverer.setTimeoutBuffer(0);
     // Spring's default DLT headers already carry original topic/partition/offset/key plus
     // exception type/message/stacktrace; append only what is missing: failure time and a
     // closed-bucket reason for operators.
@@ -182,6 +198,8 @@ public class KafkaConfig {
 
     DefaultErrorHandler handler = new DefaultErrorHandler(
         (record, ex) -> {
+          // historyDlt increments only after accept() returns: a failed or timed-out
+          // DLT send throws first, so "attempted DLT" is never counted as "in DLT".
           recoverer.accept(record, ex);
           metrics.historyDlt(ShoreMetrics.classify(ex));
         },

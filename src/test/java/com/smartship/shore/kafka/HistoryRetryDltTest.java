@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -117,6 +118,16 @@ class HistoryRetryDltTest {
     dltTemplate = mock(org.springframework.kafka.core.KafkaTemplate.class);
     doReturn(CompletableFuture.completedFuture(mock(SendResult.class)))
         .when(dltTemplate).send(any(ProducerRecord.class));
+    // The recoverer derives its wait from the producer factory; a null factory would
+    // fall back to a 30s default ("only in mock tests" per framework source), so hand
+    // it a real factory with a short timeout to exercise the production timeout path.
+    java.util.Map<String, Object> dltProps = new java.util.HashMap<>();
+    dltProps.put(org.apache.kafka.clients.producer.ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
+        "dummy:9092");
+    dltProps.put(org.apache.kafka.clients.producer.ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG,
+        4000);
+    doReturn(new org.springframework.kafka.core.DefaultKafkaProducerFactory<>(dltProps))
+        .when(dltTemplate).getProducerFactory();
     // The exact production wiring (interval 1s × 3 attempts).
     handler = KafkaConfig.historyErrorHandler(dltTemplate, metrics);
 
@@ -250,12 +261,14 @@ class HistoryRetryDltTest {
     }
     verify(dltTemplate, never()).send(any(ProducerRecord.class));
 
-    // Attempt 4: budget spent → exactly one DLT record.
+    // Attempt 4: budget spent → exactly one DLT record, recovery reported complete.
+    boolean recovered = false;
     try {
       failingConsumer.listen(rec, new TestAck());
     } catch (Exception e) {
-      handler.handleOne(e, rec, kafkaConsumer, container);
+      recovered = handler.handleOne(e, rec, kafkaConsumer, container);
     }
+    assertTrue(recovered, "successful DLT publish must mark recovery complete");
 
     assertEquals(0L, repository.countAll(), "nothing persisted");
     ProducerRecord<String, String> dlt = singleDltSend();
@@ -322,5 +335,105 @@ class HistoryRetryDltTest {
     assertEquals(json, dlt.value(), "original payload preserved verbatim");
     assertEquals(0.0, metrics.retryCount("transient"));
     assertEquals(1.0, metrics.dltCount("poison"));
+  }
+
+  @Test
+  @DisplayName("DLT publish failure → not recovered, metric 0, no offset commit, retryable later")
+  void dltFailureIsNotSilentSuccess() {
+    // The DLT send itself fails: the failure must surface instead of committing the offset.
+    // (handleOne swallows recovery exceptions and reports false — that boolean, not a
+    // throw, is the framework's "not recovered" signal.)
+    doReturn(CompletableFuture.<org.springframework.kafka.support.SendResult<String, String>>failedFuture(
+            new RuntimeException("dlt broker unavailable")))
+        .when(dltTemplate).send(any(ProducerRecord.class));
+
+    TelemetryHistoryRepository failing = mock(TelemetryHistoryRepository.class);
+    doThrow(new TransientDataAccessResourceException("connection reset"))
+        .when(failing).insert(any(TelemetryHistoryEntity.class));
+    HistoryConsumer failingConsumer = new HistoryConsumer(failing, objectMapper, metrics);
+    String json = envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z");
+    ConsumerRecord<String, String> rec = record("413999999", json);
+
+    // Attempts 1–3: bounded retries, no DLT attempt succeeding.
+    for (int i = 0; i < 3; i++) {
+      try {
+        failingConsumer.listen(rec, new TestAck());
+      } catch (Exception e) {
+        handler.handleOne(e, rec, kafkaConsumer, container);
+      }
+    }
+
+    // Attempt 4: recovery runs, the DLT send fails → not recovered (false, not silent true).
+    boolean recovered = true;
+    try {
+      failingConsumer.listen(rec, new TestAck());
+    } catch (Exception e) {
+      recovered = handler.handleOne(e, rec, kafkaConsumer, container);
+    }
+    assertTrue(!recovered, "failed DLT publish must not count as recovered");
+    assertEquals(0.0, metrics.dltCount("transient"), "failed DLT is never counted as in-DLT");
+    assertEquals(0.0, metrics.dltCount("poison"));
+    // The original offset must not advance on a failed recovery.
+    verify(kafkaConsumer, never()).commitSync(anyMap());
+    verify(kafkaConsumer, never()).commitSync(any(java.time.Duration.class));
+    verify(kafkaConsumer, never()).commitSync(anyMap(), any(java.time.Duration.class));
+    verify(kafkaConsumer, never()).commitSync();
+
+    // Recovery stays possible afterwards: once the DLT send works, it completes.
+    // (Tracker state resets on recovery failure, so this may take a fresh retry cycle.)
+    doReturn(CompletableFuture.completedFuture(mock(SendResult.class)))
+        .when(dltTemplate).send(any(ProducerRecord.class));
+    org.mockito.Mockito.clearInvocations(dltTemplate); // forget the failed attempt above
+    recovered = false;
+    for (int i = 0; i < 10 && !recovered; i++) {
+      try {
+        failingConsumer.listen(rec, new TestAck());
+      } catch (Exception e) {
+        recovered = handler.handleOne(e, rec, kafkaConsumer, container);
+      }
+    }
+    assertTrue(recovered, "recovery must be allowed again after the DLT send recovers");
+    singleDltSend();
+    assertEquals(1.0, metrics.dltCount("transient"));
+  }
+
+  @Test
+  @DisplayName("DLT send never completes → bounded 5s wait → recovery failure, no commit")
+  void dltTimeoutIsBounded() {
+    // A send future that never settles: the recoverer must give up on its own timeout.
+    doReturn(new CompletableFuture<SendResult<String, String>>())
+        .when(dltTemplate).send(any(ProducerRecord.class));
+
+    TelemetryHistoryRepository failing = mock(TelemetryHistoryRepository.class);
+    doThrow(new TransientDataAccessResourceException("connection reset"))
+        .when(failing).insert(any(TelemetryHistoryEntity.class));
+    HistoryConsumer failingConsumer = new HistoryConsumer(failing, objectMapper, metrics);
+    ConsumerRecord<String, String> rec = record("413999999",
+        envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z"));
+
+    for (int i = 0; i < 3; i++) {
+      try {
+        failingConsumer.listen(rec, new TestAck());
+      } catch (Exception e) {
+        handler.handleOne(e, rec, kafkaConsumer, container);
+      }
+    }
+
+    long started = System.nanoTime();
+    boolean recovered = true;
+    try {
+      failingConsumer.listen(rec, new TestAck());
+    } catch (Exception e) {
+      recovered = handler.handleOne(e, rec, kafkaConsumer, container);
+    }
+    long elapsedMs = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+        System.nanoTime() - started);
+
+    assertTrue(!recovered, "timed-out DLT publish must not count as recovered");
+    assertTrue(elapsedMs >= 3000, "the 5s DLT bound must actually be waited out, took "
+        + elapsedMs + " ms");
+    assertTrue(elapsedMs < 30000, "DLT wait must be bounded, took " + elapsedMs + " ms");
+    assertEquals(0.0, metrics.dltCount("transient"), "timed-out DLT is never counted");
+    verify(kafkaConsumer, never()).commitSync(anyMap());
   }
 }

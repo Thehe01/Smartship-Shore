@@ -136,7 +136,9 @@ future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
   按 1s 间隔有限重试 3 次（禁止 `UNLIMITED_ATTEMPTS`），耗尽后进
   `ship.telemetry.raw.DLT`；JSON 无法解析 / 缺必填字段 / 确定性 SQL 错误直接进
   DLT，不做无意义重试，也不再 log+ACK 永久丢弃。DLT publish 成功后原 offset
-  才推进（`commitRecovered`）。DLT 保留：原 topic/partition/offset、key（MMSI
+  才推进（`commitRecovered`）。DLT publish 本身有界：`failIfSendResultIsError` +
+  5s 等待（生产者 `delivery.timeout.ms` 同步 5s 上限），失败/超时则恢复失败、
+  不推进 offset、不计入 DLT 指标，后续重投继续恢复。DLT 保留：原 topic/partition/offset、key（MMSI
   不变）、原始 payload、异常类型/信息/堆栈，以及 Spring 默认头之外的
   `shore-dlt-failed-at`（失败时间）与 `shore-dlt-reason`（`transient`/`poison`）。
   语义仍只是 at-least-once + 幂等，不宣称 exactly-once，更不宣称零丢失。
@@ -192,7 +194,7 @@ mvn clean package
 | E2E | `HistoryConsumerTestcontainersTest` | 真实 Kafka(KRaft)+MySQL（含 Flyway V1）；无 Docker 时自动跳过 |
 | E2E | `TrueE2EMqttKafkaMySqlTest` | 真实 Mosquitto→岸端服务→Kafka→Consumer→MySQL；断言 row=1、`data.speed_knots=12.5`、无 `data.data`；无 Docker 跳过 |
 | E2E | `MqttRedeliveryE2ETest`（P2-1.2） | 只 publish 一次：首次 handoff 失败→不断线重投原 QoS1→恢复后恰一行，`msg_id` 不变；无 Docker 跳过 |
-| — | `HistoryRetryDltTest`（P2-2） | 正常/重复不进 DLT；失败两次第三次成功落库；持续失败耗尽后恰 1 条 DLT；毒消息/缺字段直达 DLT 零重试；DLT 保留原 topic/key/payload/异常头 |
+| — | `HistoryRetryDltTest`（P2-2 / P2-2.1） | 正常/重复不进 DLT；失败两次第三次成功落库；持续失败耗尽后恰 1 条 DLT；毒消息/缺字段直达 DLT 零重试；DLT 失败不恢复/不计数/不提交、后续可再恢复；DLT 超时约 5s 有界；DLT 保留原 topic/key/payload/异常头 |
 | E2E | `HistoryDltTestcontainersTest`（P2-2） | 真实 Kafka+MySQL：有效 envelope 落库且 DLT 为空，毒消息进 DLT 且头完整；无 Docker 跳过 |
 
 > P2-1.1 的 `MqttKafkaHandoffReliabilityTest`（脚本重发模拟重投）已被 P2-1.2 的
