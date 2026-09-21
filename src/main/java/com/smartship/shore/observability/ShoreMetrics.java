@@ -193,12 +193,21 @@ public class ShoreMetrics {
    * Closed-bucket classification shared by the retry listener and the DLT recoverer:
    * known-retryable DB failures are {@code transient}, everything else {@code poison}.
    * Never uses mmsi / msg_id / exception text as a tag.
+   *
+   * <p>Walks the whole cause chain because a real {@code @KafkaListener} failure arrives
+   * wrapped (e.g. {@code ListenerExecutionFailedException} around the DB exception);
+   * checking only the outer layer would mislabel transient outages as poison.
+   * Cycle-safe via identity tracking.
    */
   public static String classify(Throwable ex) {
-    if (ex instanceof TransientDataAccessException
-        || ex instanceof DataAccessResourceFailureException
-        || ex instanceof CannotGetJdbcConnectionException) {
-      return "transient";
+    java.util.Set<Throwable> seen =
+        java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    for (Throwable t = ex; t != null && seen.add(t); t = t.getCause()) {
+      if (t instanceof TransientDataAccessException
+          || t instanceof DataAccessResourceFailureException
+          || t instanceof CannotGetJdbcConnectionException) {
+        return "transient";
+      }
     }
     return "poison";
   }

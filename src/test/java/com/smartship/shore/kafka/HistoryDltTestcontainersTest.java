@@ -18,6 +18,7 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.kafka.support.KafkaHeaders;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -158,7 +159,12 @@ class HistoryDltTestcontainersTest {
       assertEquals("413999999", rec.key(), "key=MMSI preserved");
       assertEquals(poisonJson, rec.value(), "original payload preserved verbatim");
       assertEquals(RAW, header(rec, "kafka_dlt-original-topic"));
-      assertTrue(header(rec, "kafka_dlt-exception-fqcn").contains("InvalidTelemetryException"));
+      // A real @KafkaListener exception always arrives wrapped: the outer header names
+      // the Spring wrapper, the cause header names the shore exception that matters.
+      assertTrue(header(rec, KafkaHeaders.DLT_EXCEPTION_FQCN)
+          .contains("ListenerExecutionFailedException"));
+      assertTrue(header(rec, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN)
+          .contains("InvalidTelemetryException"));
       assertTrue(header(rec, "shore-dlt-failed-at").contains("T"), "failure time present");
       assertEquals("poison", header(rec, "shore-dlt-reason"));
 
