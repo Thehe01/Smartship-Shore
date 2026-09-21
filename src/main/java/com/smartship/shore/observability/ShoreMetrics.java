@@ -2,15 +2,22 @@ package com.smartship.shore.observability;
 
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import lombok.Getter;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.TransientDataAccessException;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
 import org.springframework.stereotype.Component;
 
 /**
- * P2-1 low-cardinality counters.
+ * P2-1 / P2-2 low-cardinality counters.
  *
- * <p>Deliberately tagless: {@code mmsi} / {@code msg_id} must never become metric tags
- * (high-cardinality risk). Stream {@code type} has only a handful of values today, but even it
- * is left out to keep the P2-1 surface minimal and predictable.
+ * <p>Deliberately tagless except the P2-2 {@code reason} bucket ({@code transient} /
+ * {@code poison}): {@code mmsi} / {@code msg_id} / exception messages must never become
+ * metric tags (high-cardinality risk). Stream {@code type} has only a handful of values
+ * today, but even it is left out to keep the surface minimal and predictable.
  */
 @Component
 @Getter
@@ -27,7 +34,13 @@ public class ShoreMetrics {
   private final Counter historyDuplicateTotal;
   private final Counter historyFailedTotal;
 
+  /** P2-2: reason bucket is closed ({@code transient} / {@code poison}) — never raw values. */
+  private final Map<String, Counter> historyRetryTotals = new ConcurrentHashMap<>();
+  private final Map<String, Counter> historyDltTotals = new ConcurrentHashMap<>();
+  private final MeterRegistry registry;
+
   public ShoreMetrics(MeterRegistry registry) {
+    this.registry = registry;
     this.mqttReceivedTotal =
         Counter.builder("smartship_shore_mqtt_received_total")
             .description("MQTT messages received from the Edge broker")
@@ -58,7 +71,7 @@ public class ShoreMetrics {
             .register(registry);
     this.historyFailedTotal =
         Counter.builder("smartship_shore_history_failed_total")
-            .description("Records that failed: transient DB errors (redelivered) or poison skips")
+            .description("Failed history delivery attempts (before retry / DLT routing)")
             .register(registry);
   }
 
@@ -92,5 +105,63 @@ public class ShoreMetrics {
 
   public void historyFailed() {
     historyFailedTotal.increment();
+  }
+
+  /**
+   * P2-2: one failed history delivery observed by the error handler. Retryable failures
+   * produce one observation per attempt (each followed by a bounded backoff, except the
+   * last one which triggers recovery); poison produces exactly one with immediate recovery.
+   *
+   * @param reason closed bucket: {@code transient} (retryable DB failure) or
+   *     {@code poison} (anything else reaching the error handler)
+   */
+  public void historyRetry(String reason) {
+    historyRetryTotals
+        .computeIfAbsent(reason, r -> Counter.builder("smartship_shore_history_retry_total")
+            .description("Bounded retry attempts for failed history records")
+            .tags(Tags.of("reason", r))
+            .register(registry))
+        .increment();
+  }
+
+  /**
+   * P2-2: one record was published to the DLT after immediate routing (poison) or
+   * retry exhaustion (transient).
+   *
+   * @param reason closed bucket: {@code transient} or {@code poison}
+   */
+  public void historyDlt(String reason) {
+    historyDltTotals
+        .computeIfAbsent(reason, r -> Counter.builder("smartship_shore_history_dlt_total")
+            .description("History records routed to the dead-letter topic")
+            .tags(Tags.of("reason", r))
+            .register(registry))
+        .increment();
+  }
+
+  /** Test/observation helper: current value of a reason-bucketed counter (0 when absent). */
+  public double retryCount(String reason) {
+    Counter c = historyRetryTotals.get(reason);
+    return c == null ? 0.0 : c.count();
+  }
+
+  /** Test/observation helper: current value of a reason-bucketed counter (0 when absent). */
+  public double dltCount(String reason) {
+    Counter c = historyDltTotals.get(reason);
+    return c == null ? 0.0 : c.count();
+  }
+
+  /**
+   * Closed-bucket classification shared by the retry listener and the DLT recoverer:
+   * known-retryable DB failures are {@code transient}, everything else {@code poison}.
+   * Never uses mmsi / msg_id / exception text as a tag.
+   */
+  public static String classify(Throwable ex) {
+    if (ex instanceof TransientDataAccessException
+        || ex instanceof DataAccessResourceFailureException
+        || ex instanceof CannotGetJdbcConnectionException) {
+      return "transient";
+    }
+    return "poison";
   }
 }

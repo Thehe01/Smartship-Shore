@@ -59,6 +59,8 @@ public class ShoreProperties {
     private String rawTopic = "ship.telemetry.raw";
     /** Partition count for the raw topic (key = MMSI keeps one ship ordered). */
     private int rawTopicPartitions = 6;
+    /** P2-2 dead-letter topic for exhausted retries and poison records. */
+    private String dltTopic = "ship.telemetry.raw.DLT";
     /** P2-1 history consumer group. */
     private String groupId = "smartship-history";
   }

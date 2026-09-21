@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.smartship.shore.EdgeFixtures;
+import com.smartship.shore.ingest.InvalidTelemetryException;
 import com.smartship.shore.observability.ShoreMetrics;
 import com.smartship.shore.persistence.TelemetryHistoryEntity;
 import com.smartship.shore.persistence.TelemetryHistoryRepository;
@@ -239,28 +240,30 @@ class HistoryConsumerTest {
   }
 
   @Test
-  @DisplayName("Poison record in Kafka: logged, counted, skipped — partition keeps moving")
-  void poisonRecordSkipped() {
+  @DisplayName("Poison record in Kafka: thrown for DLT routing, never acknowledged, never stored")
+  void poisonRecordGoesToDlt() {
     TestAck ack = new TestAck();
 
-    consumer.listen(record("413999999", "{not-json-at-all"), ack);
+    assertThrows(InvalidTelemetryException.class,
+        () -> consumer.listen(record("413999999", "{not-json-at-all"), ack));
 
-    assertTrue(ack.acknowledged);
+    assertTrue(!ack.acknowledged, "poison must NOT acknowledge (DLT path owns the offset)");
     assertEquals(0L, repository.countAll());
     assertEquals(1.0, metrics.getHistoryFailedTotal().count());
   }
 
   @Test
-  @DisplayName("Envelope missing msg_id: skipped and counted, never persisted")
-  void envelopeMissingRequiredFieldSkipped() {
+  @DisplayName("Envelope missing msg_id: thrown for DLT routing, never persisted")
+  void envelopeMissingRequiredFieldGoesToDlt() {
     TestAck ack = new TestAck();
     String json = "{\"mmsi\":\"413999999\",\"type\":\"nmea_gps\","
         + "\"timestamp\":\"2026-09-19T02:00:00Z\","
         + "\"sent_at\":\"2026-09-19T02:00:05Z\",\"data\":{\"speed_knots\":12.5}}";
 
-    consumer.listen(record("413999999", json), ack);
+    assertThrows(InvalidTelemetryException.class,
+        () -> consumer.listen(record("413999999", json), ack));
 
-    assertTrue(ack.acknowledged);
+    assertTrue(!ack.acknowledged);
     assertEquals(0L, repository.countAll());
     assertEquals(1.0, metrics.getHistoryFailedTotal().count());
   }
@@ -282,11 +285,11 @@ class HistoryConsumerTest {
   }
 
   @Test
-  @DisplayName("Connection failure is NOT a deterministic skip: it redelivers too")
+  @DisplayName("Connection failure propagates like any DB failure (bounded retry, then DLT)")
   void connectionFailureRedelivers() {
     TelemetryHistoryRepository failing = org.mockito.Mockito.mock(TelemetryHistoryRepository.class);
-    // NOTE: Spring classifies this as non-transient, but shore policy redelivers every
-    // unknown DB error and only skips proven-deterministic ones.
+    // NOTE: Spring classifies this as non-transient, but the error handler still routes
+    // every unknown DB error through bounded retry into the DLT — never a silent skip.
     org.mockito.Mockito.doThrow(new DataAccessResourceFailureException("connection reset"))
         .when(failing).insert(org.mockito.ArgumentMatchers.any());
     HistoryConsumer failingConsumer = new HistoryConsumer(failing, objectMapper, metrics);

@@ -1,16 +1,29 @@
 package com.smartship.shore.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.smartship.shore.ingest.InvalidTelemetryException;
 import com.smartship.shore.model.TelemetryEnvelope;
+import com.smartship.shore.observability.ShoreMetrics;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
+import org.springframework.dao.TransientDataAccessException;
+import org.springframework.jdbc.BadSqlGrammarException;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
@@ -18,13 +31,15 @@ import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaAdmin;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
+import org.springframework.kafka.listener.CommonErrorHandler;
 import org.springframework.kafka.listener.ContainerProperties;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.kafka.support.serializer.JsonSerializer;
 import org.springframework.util.backoff.FixedBackOff;
 
 /**
- * Kafka wiring for P2-1.
+ * Kafka wiring for P2-1 / P2-2.
  *
  * <p>Producer reliability is delegated to Kafka itself: {@code acks=all}, idempotence and
  * bounded retries — no hand-rolled retry thread. Values are JSON; keys are plain MMSI strings.
@@ -32,12 +47,23 @@ import org.springframework.util.backoff.FixedBackOff;
  * <p>Consumer semantics are at-least-once with manual offset confirmation: the offset of a
  * record is acknowledged only after MySQL has accepted it, and {@code UNIQUE(msg_id)} absorbs
  * the redelivery that follows a crash between the insert and the commit.
+ *
+ * <p>P2-2 adds bounded retry + dead-letter handling via Spring Kafka's
+ * {@code DefaultErrorHandler} / {@code DeadLetterPublishingRecoverer} / {@code FixedBackOff}:
+ * transient DB failures retry 3 times at 1s intervals, then go to the DLT; poison goes to
+ * the DLT immediately. Exactly-once is never claimed.
  */
 @Configuration
 public class KafkaConfig {
 
   /** Single P2-1 topic; key = MMSI keeps one ship on one partition (partition-local order). */
   public static final String RAW_TOPIC_BEAN = "shipTelemetryRawTopic";
+  /** P2-2 dead-letter topic bean. */
+  public static final String DLT_TOPIC_BEAN = "shipTelemetryDltTopic";
+  /** P2-2: fixed interval between bounded retries. */
+  public static final long HISTORY_RETRY_INTERVAL_MS = 1000L;
+  /** P2-2: bounded retry attempts before a record goes to the DLT. Never unlimited. */
+  public static final long HISTORY_MAX_RETRIES = 3L;
 
   @Bean
   public KafkaAdmin shoreKafkaAdmin(ShoreProperties properties) {
@@ -51,6 +77,16 @@ public class KafkaConfig {
     // Single-broker local default replica factor; raise for real clusters.
     return new NewTopic(
         properties.getKafka().getRawTopic(),
+        properties.getKafka().getRawTopicPartitions(),
+        (short) 1);
+  }
+
+  @Bean(name = DLT_TOPIC_BEAN)
+  public NewTopic shipTelemetryDltTopic(ShoreProperties properties) {
+    // Same partition count as raw so the default recoverer keeps the original partition
+    // (and therefore per-MMSI order) inside the DLT.
+    return new NewTopic(
+        properties.getKafka().getDltTopic(),
         properties.getKafka().getRawTopicPartitions(),
         (short) 1);
   }
@@ -100,21 +136,94 @@ public class KafkaConfig {
   }
 
   /**
+   * P2-2: plain string template for dead-letter publishing. The DLT carries the original
+   * key (MMSI) and the original JSON value verbatim, plus Spring Kafka's DLT headers.
+   */
+  @Bean
+  public KafkaTemplate<String, String> shoreDltKafkaTemplate(ShoreProperties properties) {
+    Map<String, Object> configs = new HashMap<>();
+    configs.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG,
+        properties.getKafka().getBootstrapServers());
+    configs.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+    configs.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+    configs.put(ProducerConfig.ACKS_CONFIG, "all");
+    configs.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+    configs.put(ProducerConfig.RETRIES_CONFIG, 5);
+    configs.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+    return new KafkaTemplate<>(new DefaultKafkaProducerFactory<>(configs));
+  }
+
+  /**
+   * P2-2 consumer error handling, built only from Spring Kafka primitives.
+   * Public static so contract tests drive the exact production wiring.
+   * <ul>
+   *   <li>retryable (transient DB failures): {@code FixedBackOff(1000ms, 3 attempts)}, then DLT;</li>
+   *   <li>anything else reaching the handler (poison, validation, deterministic SQL):
+   *   straight to the DLT with no pointless retries;</li>
+   *   <li>{@code DuplicateKeyException} never reaches this handler — the listener treats
+   *   it as success and acknowledges (idempotency unchanged);</li>
+   *   <li>{@code commitRecovered} advances the offset only after the DLT publish lands.</li>
+   * </ul>
+   */
+  public static DefaultErrorHandler historyErrorHandler(
+      KafkaTemplate<String, String> dltTemplate, ShoreMetrics metrics) {
+    DeadLetterPublishingRecoverer recoverer =
+        new DeadLetterPublishingRecoverer(dltTemplate);
+    // Spring's default DLT headers already carry original topic/partition/offset/key plus
+    // exception type/message/stacktrace; append only what is missing: failure time and a
+    // closed-bucket reason for operators.
+    recoverer.addHeadersFunction((ConsumerRecord<?, ?> record, Exception ex) ->
+        new RecordHeaders(new org.apache.kafka.common.header.Header[] {
+            new RecordHeader("shore-dlt-failed-at",
+                Instant.now().toString().getBytes(StandardCharsets.UTF_8)),
+            new RecordHeader("shore-dlt-reason",
+                ShoreMetrics.classify(ex).getBytes(StandardCharsets.UTF_8))
+        }));
+
+    DefaultErrorHandler handler = new DefaultErrorHandler(
+        (record, ex) -> {
+          recoverer.accept(record, ex);
+          metrics.historyDlt(ShoreMetrics.classify(ex));
+        },
+        new FixedBackOff(HISTORY_RETRY_INTERVAL_MS, HISTORY_MAX_RETRIES));
+    handler.addRetryableExceptions(
+        TransientDataAccessException.class,
+        DataAccessResourceFailureException.class,
+        CannotGetJdbcConnectionException.class);
+    handler.addNotRetryableExceptions(
+        InvalidTelemetryException.class,
+        DataIntegrityViolationException.class,
+        BadSqlGrammarException.class,
+        InvalidDataAccessApiUsageException.class);
+    handler.setRetryListeners(
+        (record, ex, deliveryAttempt) -> metrics.historyRetry(ShoreMetrics.classify(ex)));
+    // The original offset advances only after the DLT publish succeeds.
+    handler.setCommitRecovered(true);
+    return handler;
+  }
+
+  @Bean
+  public CommonErrorHandler shoreHistoryErrorHandler(
+      KafkaTemplate<String, String> shoreDltKafkaTemplate, ShoreMetrics metrics) {
+    return historyErrorHandler(shoreDltKafkaTemplate, metrics);
+  }
+
+  /**
    * Manual-confirm container: offsets commit only via the {@code Acknowledgment} passed to
-   * {@code HistoryConsumer}. Transient DB failures are redelivered with backoff (no DLT in
-   * P2-1); poison records are filtered inside the listener itself.
+   * {@code HistoryConsumer} (or via the error handler after a recovered DLT publish).
+   * Failures never commit early; {@code concurrency=1} preserves per-partition order into MySQL.
    */
   @Bean
   public ConcurrentKafkaListenerContainerFactory<String, String>
-      shoreKafkaListenerContainerFactory(ConsumerFactory<String, String> shoreConsumerFactory) {
+      shoreKafkaListenerContainerFactory(ConsumerFactory<String, String> shoreConsumerFactory,
+          CommonErrorHandler shoreHistoryErrorHandler) {
     ConcurrentKafkaListenerContainerFactory<String, String> factory =
         new ConcurrentKafkaListenerContainerFactory<>();
     factory.setConsumerFactory(shoreConsumerFactory);
     factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
-    // One thread in P2-1: preserves per-partition order into MySQL.
+    // One thread: preserves per-partition order into MySQL.
     factory.setConcurrency(1);
-    factory.setCommonErrorHandler(
-        new DefaultErrorHandler(new FixedBackOff(2000L, FixedBackOff.UNLIMITED_ATTEMPTS)));
+    factory.setCommonErrorHandler(shoreHistoryErrorHandler);
     return factory;
   }
 }

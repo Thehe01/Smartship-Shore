@@ -49,4 +49,5 @@ shore:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     raw-topic: ship.telemetry.raw
     raw-topic-partitions: 6
+    dlt-topic: ship.telemetry.raw.DLT
     group-id: smartship-history

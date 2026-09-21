@@ -12,10 +12,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.dao.DataAccessException;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.DuplicateKeyException;
-import org.springframework.dao.InvalidDataAccessApiUsageException;
-import org.springframework.jdbc.BadSqlGrammarException;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
@@ -28,14 +25,19 @@ import org.springframework.stereotype.Component;
  *   <li>Kafka value -&gt; direct {@link TelemetryEnvelope} deserialization + required-field
  *   validation. The value is already an envelope (written by {@code TelemetryKafkaProducer});
  *   it must <b>not</b> go through the Edge flat-JSON parser again, otherwise the business map
- *   would nest as {@code data.data.*}. Poison is logged, counted and skipped — retrying it
- *   forever would stall the partition; Retry/DLT topics arrive in P2-2.</li>
+ *   would nest as {@code data.data.*}.</li>
  *   <li>{@code UNIQUE(msg_id)} idempotency check + MySQL insert.</li>
  *   <li>Offset acknowledged <b>only after</b> the insert succeeded. Never the reverse.</li>
  * </ol>
  *
- * <p>Duplicates ({@code DuplicateKeyException}) are treated as already-processed success and
- * acknowledged — never as system errors. Transient DB failures propagate so Kafka redelivers.
+ * <p>P2-2 failure routing (executed by Spring Kafka's {@code DefaultErrorHandler}, not here):
+ * <ul>
+ *   <li>success / {@code DuplicateKeyException} — acknowledged in-listener, never retried,
+ *   never DLT'd (idempotency unchanged);</li>
+ *   <li>transient DB failures — bounded retry (1s × 3), then DLT;</li>
+ *   <li>poison (bad JSON, missing fields) and deterministic DB failures — straight to
+ *   the DLT with no pointless retries. Nothing is silently dropped anymore.</li>
+ * </ul>
  * Overall semantics: at-least-once delivery + deterministic {@code msg_id} idempotency.
  * Exactly-once is explicitly <b>not</b> claimed: a crash between a successful insert and the
  * offset commit replays the record, and the unique constraint absorbs the replay.
@@ -60,14 +62,14 @@ public class HistoryConsumer {
     try {
       envelope = readEnvelope(record.value());
     } catch (InvalidTelemetryException e) {
-      // Poison record already in Kafka (the MQTT layer filters these, but defense in depth):
-      // log it with partition/offset and skip. P2-2 will route these to a DLT.
+      // Poison already in Kafka: count it and let the error handler route it straight to
+      // the DLT (non-retryable — retrying garbage cannot heal it, and it is never dropped).
       metrics.historyFailed();
       log.error(
-          "[Shore-History] skipped unparseable record: topic={} partition={} offset={} key={} err={}",
+          "[Shore-History] unparseable record, routing to DLT: topic={} partition={} offset={}"
+              + " key={} err={}",
           record.topic(), record.partition(), record.offset(), record.key(), e.getMessage());
-      acknowledgment.acknowledge();
-      return;
+      throw e;
     }
 
     TelemetryHistoryEntity entity =
@@ -89,37 +91,28 @@ public class HistoryConsumer {
       acknowledgment.acknowledge();
     } catch (DuplicateKeyException e) {
       // Redelivery of an already-stored msg_id (normal under at-least-once): success, advance.
+      // Never retried, never DLT'd.
       metrics.historyDuplicate();
       log.info(
           "[Shore-History] duplicate absorbed: msg_id={} mmsi={} partition={} offset={}",
           envelope.getMsgId(), envelope.getMmsi(), record.partition(), record.offset());
       acknowledgment.acknowledge();
-    } catch (DataIntegrityViolationException | BadSqlGrammarException
-        | InvalidDataAccessApiUsageException e) {
-      // Deterministic failure (constraint/SQL/programming bug — retrying the same record can
-      // never heal it): log loudly and skip instead of stalling the partition.
-      // Visible, explainable, P2-1. P2-2 will route these to a DLT instead of skipping.
-      metrics.historyFailed();
-      log.error(
-          "[Shore-History] skipped record on deterministic DB failure: msg_id={} err={}",
-          envelope.getMsgId(), e.toString());
-      acknowledgment.acknowledge();
     } catch (DataAccessException e) {
-      // Any other DB failure (connectivity, lock wait, timeout, ...): do NOT acknowledge;
-      // Kafka will redeliver. Safe default: unknown DB errors redeliver, never silently skip.
+      // Every DB failure — transient (bounded retry, then DLT) or deterministic
+      // (straight to DLT) — propagates to the error handler. The offset is never
+      // committed ahead of the outcome, and nothing is silently skipped.
       metrics.historyFailed();
       log.warn(
-          "[Shore-History] transient DB failure, awaiting redelivery: msg_id={} err={}",
+          "[Shore-History] DB failure, entering retry/DLT handling: msg_id={} err={}",
           envelope.getMsgId(), e.getMessage());
       throw e;
     } catch (RuntimeException e) {
-      // Deterministic failure (bad SQL, mapping bug, ...): retrying forever cannot heal it,
-      // so log loudly and skip instead of stalling the partition. Visible, explainable, P2-1.
+      // Non-DB bug (mapping, serialization, ...): bounded retry, then DLT for inspection.
       metrics.historyFailed();
       log.error(
-          "[Shore-History] skipped record on non-transient failure: msg_id={} err={}",
+          "[Shore-History] unexpected failure, entering retry/DLT handling: msg_id={} err={}",
           envelope.getMsgId(), e.toString());
-      acknowledgment.acknowledge();
+      throw e;
     }
   }
 

@@ -1,9 +1,10 @@
 # Smartship-Shore
 
-岸端事件处理系统 **P2-1 / P2-1.1**：`MQTT → Kafka → DB` 最小可靠链路（单体 Spring Boot，不拆微服务）。
+岸端事件处理系统 **P2-1 / P2-1.1 / P2-1.2 / P2-2**：`MQTT → Kafka → DB`
+最小可靠链路 + 消费端有限重试与死信（单体 Spring Boot，不拆微服务）。
 
-> 本阶段只做 `MQTT → Kafka → MySQL`。Redis、WebSocket、Elasticsearch、告警、微服务拆分、
-> Retry/DLT 均为后续阶段，当前代码不包含。
+> 本阶段只做 `MQTT → Kafka → MySQL（含 Retry/DLT）`。Redis、WebSocket、
+> Elasticsearch、告警、微服务拆分均为后续阶段，当前代码不包含。
 
 ## 1. 项目定位
 
@@ -126,19 +127,31 @@ future 完成顺序可能打乱 MQTT ACK 顺序。P2-1.2 改成交接方式：
   `max.in.flight.requests.per.connection=5`，序列化 JSON（无类型头，纯 JSON）。
   重试全部交给 Kafka 机制，无自研重试线程。
 - **Consumer offset**：Spring Kafka `MANUAL_IMMEDIATE`，DB 成功后才
-  `acknowledge()`；瞬时 DB 异常（连接/锁/超时）不 ACK，等 Kafka 重投；
-  `DuplicateKey` 视为成功并 ACK；Kafka 里已存在的非法 payload 记录明确错误后跳过
-  （ACK，避免单条毒消息卡住 partition；Retry/DLT 留给 P2-2）。
+  `acknowledge()`；失败期间不提前提交 offset。
+  `DuplicateKey` 视为成功并 ACK（不进 Retry、不进 DLT，幂等不变）。
+- **P2-2 Retry / DLT**：只用 Spring Kafka 官方 `DefaultErrorHandler` +
+  `DeadLetterPublishingRecoverer` + `FixedBackOff`，无自研 sleep/retry 线程。
+  瞬时 DB 异常（`TransientDataAccessException` /
+  `DataAccessResourceFailureException` / `CannotGetJdbcConnectionException`）
+  按 1s 间隔有限重试 3 次（禁止 `UNLIMITED_ATTEMPTS`），耗尽后进
+  `ship.telemetry.raw.DLT`；JSON 无法解析 / 缺必填字段 / 确定性 SQL 错误直接进
+  DLT，不做无意义重试，也不再 log+ACK 永久丢弃。DLT publish 成功后原 offset
+  才推进（`commitRecovered`）。DLT 保留：原 topic/partition/offset、key（MMSI
+  不变）、原始 payload、异常类型/信息/堆栈，以及 Spring 默认头之外的
+  `shore-dlt-failed-at`（失败时间）与 `shore-dlt-reason`（`transient`/`poison`）。
+  语义仍只是 at-least-once + 幂等，不宣称 exactly-once，更不宣称零丢失。
 - **DB schema**（Flyway `V1__create_ship_telemetry_history.sql`）：
   `id / msg_id UNIQUE / mmsi / type / event_time / sent_at / received_at /
   payload(JSON) / kafka_partition / kafka_offset / created_at`，
   另有 `mmsi / type / event_time` 索引。
   `event_time` 存 Edge 原始 `timestamp`，不用岸端时间覆盖；无 timestamp 的行存 NULL。
-- **Metrics**（低基数、无 `mmsi`/`msg_id` tag）：
+- **Metrics**（低基数、无 `mmsi`/`msg_id`/异常文本 tag）：
   `smartship_shore_mqtt_received_total`、`..._mqtt_invalid_total`、
   `..._kafka_produced_total`、`..._kafka_produce_failed_total`、
   `..._history_consumed_total`、`..._history_persisted_total`、
-  `..._history_duplicate_total`、`..._history_failed_total`。
+  `..._history_duplicate_total`、`..._history_failed_total`，
+  以及 P2-2 新增 `..._history_retry_total{reason}` /
+  `..._history_dlt_total{reason}`（`reason ∈ {transient, poison}`）。
   暴露 `/actuator/health`、`/actuator/prometheus`。
 
 ## 5. 本地启动
@@ -173,12 +186,14 @@ mvn clean package
 | 4 | `HistoryConsumerTest` 重复消费 | 同 `msg_id` 两次：`row=1`、`duplicate=1`，第二次正常 ACK |
 | 5 | `HistoryConsumerTest` crash window | 先直接 insert（模拟 crash 前已提交），再投递：仍 `row=1` |
 | 6 | `HistoryConsumerTest` 多 MMSI | A/B 两船各自一行 |
-| — | `HistoryConsumerTest` 毒消息/瞬时异常 | 非法 JSON 跳过并 ACK；瞬时 DB 异常不 ACK 并抛给重投 |
-| — | `HistoryConsumerTest` Envelope 契约 | 直接反序列化、`data.speed_knots` 扁平、无 `data.data`、缺字段跳过 |
+| — | `HistoryConsumerTest` 毒消息/瞬时异常（P2-2） | 非法 JSON / 缺字段抛给 DLT（不 ACK）；瞬时 DB 异常抛给有限重试 |
+| — | `HistoryConsumerTest` Envelope 契约 | 直接反序列化、`data.speed_knots` 扁平、无 `data.data` |
 | — | `MqttIngestAckTest` 交接契约（P2-1.2） | 成功同步 ACK / 失败不 ACK 并主动断线 / 超时有界不 ACK 并断线 / 到达顺序 ACK / 毒消息丢弃并 ACK |
 | E2E | `HistoryConsumerTestcontainersTest` | 真实 Kafka(KRaft)+MySQL（含 Flyway V1）；无 Docker 时自动跳过 |
 | E2E | `TrueE2EMqttKafkaMySqlTest` | 真实 Mosquitto→岸端服务→Kafka→Consumer→MySQL；断言 row=1、`data.speed_knots=12.5`、无 `data.data`；无 Docker 跳过 |
 | E2E | `MqttRedeliveryE2ETest`（P2-1.2） | 只 publish 一次：首次 handoff 失败→不断线重投原 QoS1→恢复后恰一行，`msg_id` 不变；无 Docker 跳过 |
+| — | `HistoryRetryDltTest`（P2-2） | 正常/重复不进 DLT；失败两次第三次成功落库；持续失败耗尽后恰 1 条 DLT；毒消息/缺字段直达 DLT 零重试；DLT 保留原 topic/key/payload/异常头 |
+| E2E | `HistoryDltTestcontainersTest`（P2-2） | 真实 Kafka+MySQL：有效 envelope 落库且 DLT 为空，毒消息进 DLT 且头完整；无 Docker 跳过 |
 
 > P2-1.1 的 `MqttKafkaHandoffReliabilityTest`（脚本重发模拟重投）已被 P2-1.2 的
 > 真实原消息重投 E2E 取代并删除：手动重发会与 broker 的真实重投竞态，断言不再可靠。
@@ -191,7 +206,7 @@ mvn clean package
 - MQTT 交接等待有界（默认 5s，可配 `shore.mqtt.kafka-handoff-timeout-ms`）；
   Kafka 长时间不可用时，每条消息触发一次断线重连（已合并连续失败为单次重连），
   属 P2-1 级别的简单可解释策略，精细退避留给后续阶段。
-- Producer 异步发送失败只记指标 + 日志（P2-2 才做 Retry/DLT）。
-- Kafka 毒消息当前跳过并 ACK（有错误日志 + 指标），P2-2 转 DLT。
+- Producer 异步发送失败（MQTT→Kafka 段）只记指标 + 日志，本阶段未加重试；
+  Retry/DLT 覆盖的是 Kafka→DB 段（`HistoryConsumer`）。
 - 单 consumer（`concurrency=1`，保 partition 内顺序写库）；吞吐上限即单线程写库能力，未做 benchmark。
 - 未验证：百万 TPS、零丢失、高并发生产流量。以上均需后续真实压测数据支撑。
