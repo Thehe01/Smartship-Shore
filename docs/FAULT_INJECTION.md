@@ -9,8 +9,8 @@
 |---|---|---|---|
 | P2-4.2.1 | MySQL 短暂故障（pause → 恢复） | transient retry → 恢复后落库，Redis 不受影响，DLT 0 | ✅ CI 已绿（[Run 35630161627](https://github.com/Thehe01/Smartship-Shore/actions/runs/35630161627)） |
 | P2-4.2.2 | Redis 短暂故障（pause → 恢复） | History 不受影响，latest retry → 恢复后投影，DLT 0 | ✅ CI 已绿（[Run 35632810172](https://github.com/Thehe01/Smartship-Shore/actions/runs/35632810172)） |
-| P2-4.2.3 | MySQL 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动落库，B 正常落库 | 🟡 代码完成，CI 待验 |
-| P2-4.2.4 | Redis 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动投影，B 正常 | 🟡 代码完成，CI 待验 |
+| P2-4.2.3 | MySQL 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动落库，B 正常落库 | ✅ CI 已绿（run URL 待补） |
+| P2-4.2.4 | Redis 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动投影，B 正常 | ✅ CI 已绿（run URL 待补） |
 | P2-4.2.5 | Kafka 短暂故障 → MQTT QoS1 重投 | 待做 | ⬜ |
 | P2-4.2.6 | Shore crash/restart → replay + 幂等 | 待做 | ⬜ |
 
@@ -65,7 +65,7 @@
   DLT 两 bucket 为 0 且 DLT topic snapshot 为 0、Redis payload
   `msg_id`/`timestamp` 正确且 TTL 生效、`lost == 0`。
 
-## P2-4.2.3 MySQL sustained outage → DLT（代码完成，CI 待验）
+## P2-4.2.3 MySQL sustained outage → DLT（CI 已绿）
 
 用例：`com.smartship.shore.fault.MySqlSustainedOutageTest`
 （与 2.1 同 infra 与同套 test-only Hikari fast-fail 超时；生产 retry/backoff 未动）。
@@ -88,7 +88,7 @@
   `DISTINCT(msg_id) == 1`、B 在库而 A 永不在库、DLT 总数仍 1、
   Redis 两键 payload 与 TTL 正确。无 silent loss：A 在 DLT，B 在 MySQL。
 
-## P2-4.2.4 Redis sustained outage → DLT（代码完成，CI 待验）
+## P2-4.2.4 Redis sustained outage → DLT（CI 已绿）
 
 用例：`com.smartship.shore.fault.RedisSustainedOutageTest`
 （与 2.2 同 infra 与同套 test-only `spring.data.redis.timeout=2s`；
