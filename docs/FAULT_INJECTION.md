@@ -10,7 +10,7 @@
 | P2-4.2.1 | MySQL 短暂故障（pause → 恢复） | transient retry → 恢复后落库，Redis 不受影响，DLT 0 | ✅ CI 已绿（[Run 35630161627](https://github.com/Thehe01/Smartship-Shore/actions/runs/35630161627)） |
 | P2-4.2.2 | Redis 短暂故障（pause → 恢复） | History 不受影响，latest retry → 恢复后投影，DLT 0 | ✅ CI 已绿（[Run 35632810172](https://github.com/Thehe01/Smartship-Shore/actions/runs/35632810172)） |
 | P2-4.2.3 | MySQL 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动落库，B 正常落库 | 🟡 代码完成，CI 待验 |
-| P2-4.2.4 | Redis 持续故障 → DLT | 待做 | ⬜ |
+| P2-4.2.4 | Redis 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动投影，B 正常 | 🟡 代码完成，CI 待验 |
 | P2-4.2.5 | Kafka 短暂故障 → MQTT QoS1 重投 | 待做 | ⬜ |
 | P2-4.2.6 | Shore crash/restart → replay + 幂等 | 待做 | ⬜ |
 
@@ -87,3 +87,28 @@
   poison DLT 增量 0、`history_persisted` 增量 == 1（仅 B）、`rows == 1`、
   `DISTINCT(msg_id) == 1`、B 在库而 A 永不在库、DLT 总数仍 1、
   Redis 两键 payload 与 TTL 正确。无 silent loss：A 在 DLT，B 在 MySQL。
+
+## P2-4.2.4 Redis sustained outage → DLT（代码完成，CI 待验）
+
+用例：`com.smartship.shore.fault.RedisSustainedOutageTest`
+（与 2.2 同 infra 与同套 test-only `spring.data.redis.timeout=2s`；
+生产 retry/backoff 未动）。
+
+- **核心命题**（2.3 的镜像）：DLT 是终局，不是延迟队列。恢复后 A 不得自行
+  投影；再发 B 并正常投影，证明 failed offset 已 recovery/commit 且 consumer
+  继续推进。
+- **组归属证明**（不耦合异常类名）：MySQL 最终持有 A **和** B
+  （`history_persisted` 增量 == 2），证明 history 组全程零失败——唯一的 DLT
+  记录只能来自 latest-state 组。transient 路由本身由已绿的 2.2 背书。
+- **时序**（全 bounded wait）：ready 门全过 → pause Redis → 发布 A →
+  History 落库 A（MySQL 健康，允许直查）且 `latest_state_failed`/
+  `history_retry{transient}` 增长（只读 metrics，**pause 期间不查 Redis**）→
+  继续保持 pause，直到 `history_dlt{transient}` 增量出现（耗尽证明，不靠
+  sleep 猜）→ unpause（`finally` 保底）。
+- **恢复后三段式**：先等 Redis PING 通 → 断言 A 键无 payload；
+  再读 DLT snapshot：恰 1 条、key 为 A 的 MMSI、value 含 A 的 `msg_id`、
+  `shore-dlt-reason == transient`；最后发布健康消息 B → 120s 内投影 + 落库。
+- **验收**：`latest_state_failed` 增量 ≥ 1、transient retry > 0、
+  DLT transient 增量 == 1、poison 增量 0、`history_persisted` 增量 == 2、
+  `rows == 2`（A、B 均在库）、A 永不进 Redis、B payload/TTL 正确、
+  DLT 总数仍 1。无 silent loss：A = MySQL + DLT，B = MySQL + Redis。
