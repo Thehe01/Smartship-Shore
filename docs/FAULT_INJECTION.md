@@ -11,7 +11,7 @@
 | P2-4.2.2 | Redis 短暂故障（pause → 恢复） | History 不受影响，latest retry → 恢复后投影，DLT 0 | ✅ CI 已绿（[Run 35632810172](https://github.com/Thehe01/Smartship-Shore/actions/runs/35632810172)） |
 | P2-4.2.3 | MySQL 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动落库，B 正常落库 | ✅ CI 已绿（[Run 35677646998](https://github.com/Thehe01/Smartship-Shore/actions/runs/35677646998)） |
 | P2-4.2.4 | Redis 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动投影，B 正常 | ✅ CI 已绿（[Run 35679570625](https://github.com/Thehe01/Smartship-Shore/actions/runs/35679570625)） |
-| P2-4.2.5 | Kafka 短暂故障 → MQTT QoS1 重投 | 待做 | ⬜ |
+| P2-4.2.5 | Kafka 短暂故障 → MQTT QoS1 重投 | 重投循环 → 恢复后单行落库，DLT 0 | 🟡 代码完成，CI 待验 |
 | P2-4.2.6 | Shore crash/restart → replay + 幂等 | 待做 | ⬜ |
 
 ## P2-4.2.1 MySQL transient outage
@@ -112,3 +112,24 @@
   DLT transient 增量 == 1、poison 增量 0、`history_persisted` 增量 == 2、
   `rows == 2`（A、B 均在库）、A 永不进 Redis、B payload/TTL 正确、
   DLT 总数仍 1。无 silent loss：A = MySQL + DLT，B = MySQL + Redis。
+
+## P2-4.2.5 Kafka transient outage → MQTT QoS1 redelivery（代码完成，CI 待验）
+
+用例：`com.smartship.shore.fault.KafkaTransientOutageTest`
+（Kafka + MySQL + Mosquitto + Redis 全真实容器；**零** test-only 调参，
+生产 5s handoff 超时即是故障转换器）。
+
+- **故障手法**：Docker `pause` 冻住 KRaft broker，`unpause` 恢复
+  （`finally` 保底）。`KafkaTemplate.send` 非阻塞，冻住后 future 悬挂，
+  5s handoff 到时即触发无 ACK + 强制重连 → durable 会话重投原 QoS1。
+- **重投证明**（非事后推断）：ACK 只在 handoff 成功后发出，所以 Kafka 仍
+  暂停时 `mqtt_received` 增量 ≥ 2 本身就是重投循环转起来的确定性证据；
+  同期 MySQL 0 行、Redis 无投影（两者健康，可直查），证明无泄漏。
+- **时序**（全 bounded wait，单次 publish 永不手动重发）：ready 门全过 →
+  pause Kafka → 发布 A → 120s 内观测到重投 → unpause → 180s 内 MySQL 收敛
+  1 行（hung 住的 send 若在恢复后落地成复本，由 `UNIQUE(msg_id)` 吸收，
+  故只断言单行 + `DISTINCT == 1`，不对复本数做脆弱断言）。
+- **验收**：`mqtt_received` 增量 ≥ 2、`rows == 1`、`DISTINCT(msg_id) == 1`、
+  `history_persisted` 增量 == 1、`kafka_produced` 增量 ≥ 1、
+  DLT 两 bucket 为 0 且 DLT topic snapshot 为 0、Redis payload/TTL 正确、
+  `lost == 0`。
