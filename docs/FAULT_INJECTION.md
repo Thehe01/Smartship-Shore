@@ -11,7 +11,7 @@
 | P2-4.2.2 | Redis 短暂故障（pause → 恢复） | History 不受影响，latest retry → 恢复后投影，DLT 0 | ✅ CI 已绿（[Run 35632810172](https://github.com/Thehe01/Smartship-Shore/actions/runs/35632810172)） |
 | P2-4.2.3 | MySQL 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动落库，B 正常落库 | ✅ CI 已绿（[Run 35677646998](https://github.com/Thehe01/Smartship-Shore/actions/runs/35677646998)） |
 | P2-4.2.4 | Redis 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动投影，B 正常 | ✅ CI 已绿（[Run 35679570625](https://github.com/Thehe01/Smartship-Shore/actions/runs/35679570625)） |
-| P2-4.2.5 | Kafka 短暂故障 → MQTT QoS1 重投 | 重投循环 → 恢复后单行落库，DLT 0 | 🟡 代码完成，CI 待验 |
+| P2-4.2.5 | Kafka 短暂故障 → MQTT QoS1 重投 | 重投循环 → 恢复后单行落库，DLT 0 | ✅ CI 已绿（[Run 35681578037](https://github.com/Thehe01/Smartship-Shore/actions/runs/35681578037)） |
 | P2-4.2.6 | Shore crash/restart → replay + 幂等 | 待做 | ⬜ |
 
 ## P2-4.2.1 MySQL transient outage
@@ -113,7 +113,7 @@
   `rows == 2`（A、B 均在库）、A 永不进 Redis、B payload/TTL 正确、
   DLT 总数仍 1。无 silent loss：A = MySQL + DLT，B = MySQL + Redis。
 
-## P2-4.2.5 Kafka transient outage → MQTT QoS1 redelivery（代码完成，CI 待验）
+## P2-4.2.5 Kafka transient outage → MQTT QoS1 redelivery（CI 已绿）
 
 用例：`com.smartship.shore.fault.KafkaTransientOutageTest`
 （Kafka + MySQL + Mosquitto + Redis 全真实容器；**零** test-only 调参，
