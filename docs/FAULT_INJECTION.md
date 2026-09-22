@@ -12,7 +12,7 @@
 | P2-4.2.3 | MySQL 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动落库，B 正常落库 | ✅ CI 已绿（[Run 35677646998](https://github.com/Thehe01/Smartship-Shore/actions/runs/35677646998)） |
 | P2-4.2.4 | Redis 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动投影，B 正常 | ✅ CI 已绿（[Run 35679570625](https://github.com/Thehe01/Smartship-Shore/actions/runs/35679570625)） |
 | P2-4.2.5 | Kafka 短暂故障 → MQTT QoS1 重投 | 重投循环 → 恢复后单行落库，DLT 0 | ✅ CI 已绿（[Run 35681578037](https://github.com/Thehe01/Smartship-Shore/actions/runs/35681578037)） |
-| P2-4.2.6 | Shore crash/restart → replay + 幂等 | 重投被去重吸收，B 正常，DLT 0 | 🟡 代码完成，CI 待验 |
+| P2-4.2.6 | Shore crash/restart → replay + 幂等 | 重投被去重吸收，B 正常，DLT 0 | ✅ CI 已绿（[Run 35683110289](https://github.com/Thehe01/Smartship-Shore/actions/runs/35683110289)） |
 
 ## P2-4.2.1 MySQL transient outage
 
@@ -134,7 +134,7 @@
   DLT 两 bucket 为 0 且 DLT topic snapshot 为 0、Redis payload/TTL 正确、
   `lost == 0`。
 
-## P2-4.2.6 Shore crash/restart → replay + 幂等（代码完成，CI 待验）
+## P2-4.2.6 Shore crash/restart → replay + 幂等（CI 已绿）
 
 用例：`com.smartship.shore.fault.ShoreRestartReplayTest`
 （Kafka + MySQL + Mosquitto + Redis 全真实容器；无基础设施被冻，
