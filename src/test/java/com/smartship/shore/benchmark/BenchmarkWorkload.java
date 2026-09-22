@@ -87,9 +87,46 @@ public final class BenchmarkWorkload {
     return out;
   }
 
+  /**
+   * P2-4.1.1 concurrent-producer workload: message {@code globalSeq} belongs to
+   * producer {@code globalSeq % producerCount} (independent MMSI per producer)
+   * at that producer's own index {@code globalSeq / producerCount}.
+   *
+   * <p>Determinism and ordering mirror {@link #build}: event time grows with
+   * the global sequence, hence strictly within each producer's own stream and
+   * within each (mmsi, type) subsequence — the Redis latest-state verification
+   * stays exact. Each producer publishes only its own MMSIs, so per-key
+   * arrival order equals event-time order despite thread interleaving.
+   */
+  public static Spec concurrentSpec(String runId, int producerCount, int globalSeq) {
+    int producerIdx = Math.floorMod(globalSeq, producerCount);
+    int ownIdx = globalSeq / producerCount;
+    String mmsi = mmsi(producerIdx);
+    String type = TYPES.get(ownIdx % TYPES.size());
+    Instant eventTime = EVENT_BASE.plusSeconds(globalSeq);
+    String rowTs = LocalDateTime.ofInstant(eventTime, EDGE_ZONE).format(ROW_FMT);
+    return new Spec(globalSeq, mmsi, type, "zncb/" + mmsi + "/" + topicSuffix(type),
+        msgId(runId, mmsi, type, globalSeq), eventTime, rowTs,
+        businessData(type, globalSeq));
+  }
+
+  /**
+   * Last global sequence below {@code messages} carrying the given
+   * (producer, type) combo, or {@code -1} when the combo never occurs.
+   */
+  public static int lastConcurrentSeqFor(int producerCount, int messages,
+      int producerIdx, int typeIdx) {
+    for (int n = messages - 1; n >= 0; n--) {
+      if (Math.floorMod(n, producerCount) == producerIdx
+          && (n / producerCount) % TYPES.size() == typeIdx) {
+        return n;
+      }
+    }
+    return -1;
+  }
+
   /** Deterministic unique fingerprint; rerunning the same runId reproduces it exactly. */
-  public static String msgId(String runId, String mmsi, String type, int seq) {
-    try {
+  public static String msgId(String runId, String mmsi, String type, int seq) {    try {
       String canonical = runId + "|" + mmsi + "|" + type + "|" + seq;
       byte[] digest = MessageDigest.getInstance("SHA-256")
           .digest(canonical.getBytes(StandardCharsets.UTF_8));
@@ -122,8 +159,7 @@ public final class BenchmarkWorkload {
     return sb.toString();
   }
 
-  /** Last sequence number below {@code size} carrying the given (mmsi, type) combo. */
-  public static int lastSeqFor(int mmsiIdx, int typeIdx, int size) {
+  /** Last sequence number below {@code size} carrying the given (mmsi, type) combo. */  public static int lastSeqFor(int mmsiIdx, int typeIdx, int size) {
     int combo = mmsiIdx + MMSI_COUNT * typeIdx;
     int last = combo;
     while (last + MMSI_COUNT * TYPES.size() < size) {

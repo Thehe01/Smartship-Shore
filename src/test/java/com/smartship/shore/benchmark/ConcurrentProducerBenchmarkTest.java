@@ -9,7 +9,6 @@ import com.smartship.shore.observability.ShoreMetrics;
 import com.smartship.shore.persistence.TelemetryHistoryRepository;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
-import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -19,10 +18,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -31,10 +34,10 @@ import org.eclipse.paho.client.mqttv3.MqttClient;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.Assumptions;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.data.redis.core.RedisCallback;
@@ -54,18 +57,21 @@ import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
 /**
- * P2-4.1 baseline benchmark: deterministic workload through the REAL full chain
- * (benchmark publisher → Mosquitto → shore → Kafka → MySQL + Redis), no mocks,
- * no direct listener calls, no skipped MQTT hop.
+ * P2-4.1.1 concurrent-producer pressure: several independent Edge publishers
+ * (own MQTT client, own connection, own MMSIs, deterministic msg_id, no shared
+ * send state) drive the REAL full chain
+ * (publishers → Mosquitto → shore → Kafka → MySQL + Redis) at a fixed total
+ * message count. No mocks, no direct listener calls, no skipped MQTT hop.
  *
- * <p>Opt-in only: {@code @Tag("benchmark")} plus the {@code benchmark} Maven profile.
- * Plain {@code mvn test} and normal CI never execute this class; without Docker it
- * skips gracefully.
+ * <p>Opt-in only: {@code @Tag("benchmark")} plus the {@code benchmark} Maven
+ * profile, plus {@code BENCHMARK_MODE=concurrent}. Plain {@code mvn test},
+ * normal CI, and the baseline size sweep ({@code ShoreBenchmarkTest}) never
+ * execute this class; without Docker it skips gracefully.
  *
- * <p>One Spring context and one container set serve the whole run (warm-up + every
- * size). State is cleaned between cases (MySQL {@code TRUNCATE}, Redis
- * {@code FLUSHDB}); each case carries its own {@code run_id} inside every
- * {@code msg_id} so reruns never collide on {@code UNIQUE(msg_id)}.
+ * <p>One Spring context and one container set serve the whole run. State is
+ * cleaned between cases (MySQL {@code TRUNCATE}, Redis {@code FLUSHDB}); each
+ * case carries its own {@code run_id} inside every {@code msg_id} so reruns
+ * never collide on {@code UNIQUE(msg_id)}.
  */
 @Tag("benchmark")
 @Testcontainers(disabledWithoutDocker = true)
@@ -74,11 +80,11 @@ import org.testcontainers.utility.MountableFile;
     "spring.flyway.enabled=true",
     "spring.kafka.listener.auto-startup=true"
 })
-class ShoreBenchmarkTest {
+class ConcurrentProducerBenchmarkTest {
 
-  private static final int WARMUP_MESSAGES = 500;
+  private static final int DEFAULT_MESSAGES = 10000;
+  private static final String DEFAULT_COUNTS = "1,10,50";
   private static final int PUBLISH_WINDOW = 200;
-  private static final String DEFAULT_SIZES = "1000,10000,50000";
 
   @Container
   static final KafkaContainer KAFKA =
@@ -113,7 +119,7 @@ class ShoreBenchmarkTest {
   static void infra(DynamicPropertyRegistry registry) {
     registry.add("shore.mqtt.broker-url",
         () -> "tcp://" + MOSQUITTO.getHost() + ":" + MOSQUITTO.getMappedPort(1883));
-    registry.add("shore.mqtt.client-id", () -> "bench-shore");
+    registry.add("shore.mqtt.client-id", () -> "bench-conc-shore");
     registry.add("shore.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
     registry.add("spring.datasource.url",
         () -> MYSQL.getJdbcUrl()
@@ -150,33 +156,35 @@ class ShoreBenchmarkTest {
   private KafkaListenerEndpointRegistry listenerRegistry;
 
   @Test
-  @DisplayName("Baseline: deterministic workload through the real chain, per size")
-  void baselineBenchmark() throws Exception {
-    // P2-4.1.1: BENCHMARK_MODE=concurrent selects the concurrent-producer
-    // scenario instead; abort here so one `-Pbenchmark` invocation runs exactly
-    // one scenario. Unset/blank/baseline keeps the historical default.
-    Assumptions.assumeTrue(isBaselineMode(),
-        "BENCHMARK_MODE=concurrent selects ConcurrentProducerBenchmarkTest");
-    List<Integer> sizes = parseSizes();
+  @DisplayName("Concurrent producers: independent publishers through the real chain, per count")
+  void concurrentBenchmark() throws Exception {
+    Assumptions.assumeTrue("concurrent".equalsIgnoreCase(System.getenv("BENCHMARK_MODE")),
+        "BENCHMARK_MODE=concurrent selects the concurrent-producer scenario");
+    int messages = parseMessages();
+    List<Integer> counts = parseCounts();
     Map<String, Object> config = new LinkedHashMap<>();
-    config.put("sizes", sizes);
-    config.put("mmsiCount", BenchmarkWorkload.MMSI_COUNT);
+    config.put("mode", "concurrent");
+    config.put("messages", messages);
+    config.put("producerCounts", counts);
     config.put("types", BenchmarkWorkload.TYPES);
-    config.put("warmupMessages", WARMUP_MESSAGES);
     config.put("rawTopic", properties.getKafka().getRawTopic());
     config.put("dltTopic", properties.getKafka().getDltTopic());
     config.put("historyGroup", properties.getKafka().getGroupId());
     config.put("latestGroup", properties.getKafka().getLatestStateGroupId());
     config.put("latestStateTtlSeconds", properties.getRedis().getLatestStateTtlSeconds());
 
-    BenchmarkReport report = BenchmarkReport.create(config);
-    report.notes.add("Warm-up (500 messages) is excluded from every result below.");
+    ConcurrentProducerReport report = ConcurrentProducerReport.create(config);
+    report.notes.add("Every message is published exactly once per its owner producer; "
+        + "message n always belongs to producer (n % producerCount) with a deterministic "
+        + "msg_id, so reruns reproduce the workload exactly.");
+    report.notes.add("Each producer owns an independent MQTT client, connection and MMSI "
+        + "set; no send state is shared between producers.");
     report.notes.add("Percentiles use nearest-rank over real per-row samples.");
     report.notes.add("History P50/P95/P99 are RECEIVE latencies: publish-side sent_at to"
         + " HistoryConsumer receive/processing timestamp; they exclude per-row MySQL"
         + " insert/commit time and are not Kafka broker latencies. Batch persistence"
         + " convergence is measured by history completion/throughput instead.");
-    report.notes.add("Redis per-message latency is not measured in P2-4.1: latest-state"
+    report.notes.add("Redis per-message latency is not measured: latest-state"
         + " projection keeps no per-message consume time.");
     report.notes.add("Single-machine Docker/Testcontainers baseline only: not a production"
         + " capacity claim, not a millions-TPS test.");
@@ -186,14 +194,11 @@ class ShoreBenchmarkTest {
     try {
       readinessGates(admin);
 
-      // Warm-up: validates the whole chain end to end, then discarded.
-      runCase("warmup", WARMUP_MESSAGES);
-
       List<String> runIds = new ArrayList<>();
-      for (int size : sizes) {
-        String runId = "r" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+      for (int producerCount : counts) {
+        String runId = "c" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         runIds.add(runId);
-        BenchmarkResult result = runCase(runId, size);
+        ConcurrentProducerResult result = runCase(runId, producerCount, messages);
         report.results.add(result);
       }
       report.configuration.put("runIds", runIds);
@@ -207,10 +212,11 @@ class ShoreBenchmarkTest {
   }
 
   // ------------------------------------------------------------------
-  // One measured case (null report = warm-up, still fully asserted).
+  // One measured case: producerCount independent publishers, messages total.
   // ------------------------------------------------------------------
 
-  private BenchmarkResult runCase(String runId, int size) throws Exception {
+  private ConcurrentProducerResult runCase(String runId, int producerCount, int messages)
+      throws Exception {
     // Isolation: no reliance on previous rounds or container leftovers.
     jdbcTemplate.execute("TRUNCATE TABLE ship_telemetry_history");
     redisTemplate.execute((RedisCallback<Object>) connection -> {
@@ -219,63 +225,44 @@ class ShoreBenchmarkTest {
     });
     Map<String, Double> countersBefore = snapshotCounters();
 
-    List<BenchmarkWorkload.Spec> workload = BenchmarkWorkload.build(runId, size);
+    String brokerUrl =
+        "tcp://" + MOSQUITTO.getHost() + ":" + MOSQUITTO.getMappedPort(1883);
 
-    MqttClient publisher = new MqttClient(
-        "tcp://" + MOSQUITTO.getHost() + ":" + MOSQUITTO.getMappedPort(1883),
-        "bench-pub-" + runId, new MemoryPersistence());
-    MqttConnectOptions options = new MqttConnectOptions();
-    options.setCleanSession(true);
-    options.setConnectionTimeout(10);
-    options.setAutomaticReconnect(false);
-    // Paho defaults maxInflight to 10: a tight QoS1 loop over 1k+ messages would
-    // hit "Too many publishes in progress" before the broker PUBACKs drain.
-    // Bounded-inflight publishing below keeps at most PUBLISH_WINDOW unacked.
-    options.setMaxInflight(500);
-    connectWithRetry(publisher, options);
-
-    // A. Publish throughput: first publish start -> last publish return (includes
-    // bounded PUBACK drains, so this is sustainable publish throughput, not
-    // fire-and-forget enqueue rate).
+    // A. Publish throughput: first thread start -> last publish return.
     long firstSendStart = System.nanoTime();
-    int published = 0;
+    ExecutorService publishers = Executors.newFixedThreadPool(producerCount,
+        r -> {
+          Thread t = new Thread(r, "bench-conc-pub");
+          t.setDaemon(true);
+          return t;
+        });
+    List<Future<?>> futures = new ArrayList<>(producerCount);
     try {
-      for (BenchmarkWorkload.Spec spec : workload) {
-        Instant sentAt = Instant.now();
-        String json = BenchmarkWorkload.payloadJson(spec, sentAt, spec.seq());
-        MqttMessage message = new MqttMessage(json.getBytes(StandardCharsets.UTF_8));
-        message.setQos(1);
-        publisher.publish(spec.topic(), message);
-        if (++published % PUBLISH_WINDOW == 0) {
-          for (IMqttDeliveryToken token : publisher.getPendingDeliveryTokens()) {
-            token.waitForCompletion(30_000);
-          }
-        }
+      for (int p = 0; p < producerCount; p++) {
+        final int producerIdx = p;
+        futures.add(publishers.submit((Callable<Void>) () -> {
+          publishOwned(runId, producerCount, producerIdx, messages, brokerUrl);
+          return null;
+        }));
       }
-      for (IMqttDeliveryToken token : publisher.getPendingDeliveryTokens()) {
-        token.waitForCompletion(30_000);
+      for (Future<?> f : futures) {
+        f.get(10, TimeUnit.MINUTES);
       }
     } finally {
-      try {
-        publisher.disconnect();
-      } catch (Exception ignored) {
-        // Best effort; the measured assertions below decide.
-      }
-      publisher.close();
+      publishers.shutdownNow();
     }
     long publishDone = System.nanoTime();
 
-    Duration budget = Duration.ofSeconds(90L + size / 100L);
+    Duration budget = Duration.ofSeconds(90L + messages / 100L);
 
     // B. End-to-end completion: first send -> MySQL holding every row.
-    // On timeout the assertion carries progress (rows/distinct/counters) so a
-    // red 10k/50k run still tells whether the pipe stalled early or just slowed.
     try {
-      MqttTestSupport.waitUntil("history complete for " + size, budget,
-          () -> repository.countAll() == size);
+      MqttTestSupport.waitUntil("history complete for " + producerCount + " producers",
+          budget, () -> repository.countAll() == messages);
     } catch (AssertionError e) {
       throw new AssertionError(
-          "history incomplete for " + size + ": " + progressSnapshot(countersBefore), e);
+          "history incomplete for producers=" + producerCount + ": "
+              + progressSnapshot(countersBefore), e);
     }
     long historyDone = System.nanoTime();
 
@@ -283,7 +270,7 @@ class ShoreBenchmarkTest {
         "SELECT COUNT(*) FROM ship_telemetry_history", Long.class);
     long distinct = jdbcTemplate.queryForObject(
         "SELECT COUNT(DISTINCT msg_id) FROM ship_telemetry_history", Long.class);
-    long lost = size - rows;
+    long lost = messages - rows;
 
     // C. Per-row history latency samples (received_at - sent_at), nearest-rank.
     // MySQL DATETIME(3) reads back as LocalDateTime while H2 reads back as
@@ -296,19 +283,20 @@ class ShoreBenchmarkTest {
         .toArray();
 
     // Redis converge: every expected key holding its final (latest) event.
-    Map<String, ExpectedLatest> expected = expectedLatest(runId, size);
+    Map<String, ExpectedLatest> expected = expectedLatest(runId, producerCount, messages);
     try {
-      MqttTestSupport.waitUntil("redis converged for " + size, budget, () -> {
-        for (Map.Entry<String, ExpectedLatest> e : expected.entrySet()) {
-          Object payload = redisTemplate.opsForHash().entries(e.getKey()).get("payload");
-          if (payload == null || !payload.toString().contains(e.getValue().msgId())) {
-            return false;
-          }
-        }
-        return true;
-      });
+      MqttTestSupport.waitUntil("redis converged for " + producerCount + " producers",
+          budget, () -> {
+            for (Map.Entry<String, ExpectedLatest> e : expected.entrySet()) {
+              Object payload = redisTemplate.opsForHash().entries(e.getKey()).get("payload");
+              if (payload == null || !payload.toString().contains(e.getValue().msgId())) {
+                return false;
+              }
+            }
+            return true;
+          });
     } catch (AssertionError e) {
-      throw new AssertionError("redis unconverged for " + size + ": "
+      throw new AssertionError("redis unconverged for producers=" + producerCount + ": "
           + matchedKeys(expected) + "/" + expected.size() + " keys, "
           + progressSnapshot(countersBefore), e);
     }
@@ -332,15 +320,15 @@ class ShoreBenchmarkTest {
     Map<String, Double> delta = new LinkedHashMap<>();
     countersAfter.forEach((k, v) -> delta.put(k, v - countersBefore.getOrDefault(k, 0.0)));
 
-    BenchmarkResult r = new BenchmarkResult();
+    ConcurrentProducerResult r = new ConcurrentProducerResult();
     r.runId = runId;
-    r.messages = size;
-    r.mmsiCount = BenchmarkWorkload.MMSI_COUNT;
+    r.producerCount = producerCount;
+    r.messages = messages;
     r.typeCount = BenchmarkWorkload.TYPES.size();
     r.publishDurationMs = (publishDone - firstSendStart) / 1_000_000;
-    r.publishThroughputMsgS = size * 1000.0 / Math.max(r.publishDurationMs, 1);
+    r.publishThroughputMsgS = messages * 1000.0 / Math.max(r.publishDurationMs, 1);
     r.historyCompletionMs = (historyDone - firstSendStart) / 1_000_000;
-    r.historyThroughputMsgS = size * 1000.0 / Math.max(r.historyCompletionMs, 1);
+    r.historyThroughputMsgS = messages * 1000.0 / Math.max(r.historyCompletionMs, 1);
     r.historyReceiveLatencyP50Ms = BenchmarkResult.percentile(latencies, 50);
     r.historyReceiveLatencyP95Ms = BenchmarkResult.percentile(latencies, 95);
     r.historyReceiveLatencyP99Ms = BenchmarkResult.percentile(latencies, 99);
@@ -353,14 +341,15 @@ class ShoreBenchmarkTest {
     r.distinctMsgIds = distinct;
     r.dltRecords = dltRecords;
     r.lostMessages = lost;
+    r.duplicateCount = delta.getOrDefault("history_duplicate_total", 0.0);
     r.metricsDelta = delta;
 
     // Final consistency gates for this case.
-    if (rows != size) {
-      throw new AssertionError("row count " + rows + " != sent " + size);
+    if (rows != messages) {
+      throw new AssertionError("row count " + rows + " != sent " + messages);
     }
-    if (distinct != size) {
-      throw new AssertionError("distinct msg_id " + distinct + " != sent " + size);
+    if (distinct != messages) {
+      throw new AssertionError("distinct msg_id " + distinct + " != sent " + messages);
     }
     if (lost != 0) {
       throw new AssertionError("lost messages: " + lost);
@@ -371,13 +360,53 @@ class ShoreBenchmarkTest {
     if (actualKeys != expected.size()) {
       throw new AssertionError("redis keys " + actualKeys + " != expected " + expected.size());
     }
-    if (delta.getOrDefault("latest_state_stale_ignored_total", 0.0) != 0.0) {
-      throw new AssertionError("stale events observed in an ordered baseline");
-    }
-    if (delta.getOrDefault("latest_state_updated_total", 0.0) != size) {
-      throw new AssertionError("expected every message to update latest-state");
-    }
     return r;
+  }
+
+  /**
+   * One producer's share: global sequences {@code n} with {@code n % P == p},
+   * in increasing order, over an independent MQTT client and connection.
+   * Bounded PUBACK drains keep the Paho inflight window sustainable.
+   */
+  private void publishOwned(String runId, int producerCount, int producerIdx,
+      int messages, String brokerUrl) throws Exception {
+    MqttClient publisher = new MqttClient(
+        brokerUrl, "bench-conc-pub-" + runId + "-" + producerIdx, new MemoryPersistence());
+    MqttConnectOptions options = new MqttConnectOptions();
+    options.setCleanSession(true);
+    options.setConnectionTimeout(10);
+    options.setAutomaticReconnect(false);
+    // Same headroom as the baseline sweep: QoS1 bursts must not hit
+    // "Too many publishes in progress" before the broker PUBACKs drain.
+    options.setMaxInflight(500);
+    connectWithRetry(publisher, options);
+    try {
+      int drained = 0;
+      for (int n = producerIdx; n < messages; n += producerCount) {
+        BenchmarkWorkload.Spec spec =
+            BenchmarkWorkload.concurrentSpec(runId, producerCount, n);
+        Instant sentAt = Instant.now();
+        String json = BenchmarkWorkload.payloadJson(spec, sentAt, n);
+        MqttMessage message = new MqttMessage(json.getBytes(StandardCharsets.UTF_8));
+        message.setQos(1);
+        publisher.publish(spec.topic(), message);
+        if (++drained % PUBLISH_WINDOW == 0) {
+          for (IMqttDeliveryToken token : publisher.getPendingDeliveryTokens()) {
+            token.waitForCompletion(30_000);
+          }
+        }
+      }
+      for (IMqttDeliveryToken token : publisher.getPendingDeliveryTokens()) {
+        token.waitForCompletion(30_000);
+      }
+    } finally {
+      try {
+        publisher.disconnect();
+      } catch (Exception ignored) {
+        // Best effort; the measured assertions decide.
+      }
+      publisher.close();
+    }
   }
 
   // ------------------------------------------------------------------
@@ -388,13 +417,14 @@ class ShoreBenchmarkTest {
   }
 
   /** Every expected Redis key mapped to its final (latest) input event. */
-  private static Map<String, ExpectedLatest> expectedLatest(String runId, int size) {
+  private static Map<String, ExpectedLatest> expectedLatest(String runId, int producerCount,
+      int messages) {
     Map<String, ExpectedLatest> expected = new LinkedHashMap<>();
-    for (int mi = 0; mi < BenchmarkWorkload.MMSI_COUNT; mi++) {
+    for (int p = 0; p < producerCount; p++) {
       for (int ti = 0; ti < BenchmarkWorkload.TYPES.size(); ti++) {
-        int last = BenchmarkWorkload.lastSeqFor(mi, ti, size);
-        if (last < size) {
-          String mmsi = BenchmarkWorkload.mmsi(mi);
+        int last = BenchmarkWorkload.lastConcurrentSeqFor(producerCount, messages, p, ti);
+        if (last >= 0) {
+          String mmsi = BenchmarkWorkload.mmsi(p);
           String type = BenchmarkWorkload.TYPES.get(ti);
           expected.put("ship:" + mmsi + ":latest:" + type,
               new ExpectedLatest(BenchmarkWorkload.msgId(runId, mmsi, type, last),
@@ -405,31 +435,44 @@ class ShoreBenchmarkTest {
     return expected;
   }
 
-  /** Unset/blank/baseline keeps the historical size-sweep default. */
-  private static boolean isBaselineMode() {
-    String mode = System.getenv("BENCHMARK_MODE");
-    return mode == null || mode.isBlank() || "baseline".equalsIgnoreCase(mode.trim());
+  private static int parseMessages() {
+    String raw = System.getenv("MESSAGES");
+    if (raw == null || raw.isBlank()) {
+      return DEFAULT_MESSAGES;
+    }
+    final int messages;
+    try {
+      messages = Integer.parseInt(raw.trim());
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException(
+          "MESSAGES must hold a positive int, got: " + raw, e);
+    }
+    if (messages <= 0) {
+      throw new IllegalArgumentException("MESSAGES must hold a positive int: " + raw);
+    }
+    return messages;
   }
 
-  private static List<Integer> parseSizes() {
-    String raw = System.getenv("BENCHMARK_SIZES");    if (raw == null || raw.isBlank()) {
-      raw = DEFAULT_SIZES;
+  private static List<Integer> parseCounts() {
+    String raw = System.getenv("PRODUCER_COUNTS");
+    if (raw == null || raw.isBlank()) {
+      raw = DEFAULT_COUNTS;
     }
-    List<Integer> sizes = new ArrayList<>();
+    List<Integer> counts = new ArrayList<>();
     for (String part : raw.split(",")) {
-      final int size;
+      final int count;
       try {
-        size = Integer.parseInt(part.trim());
+        count = Integer.parseInt(part.trim());
       } catch (NumberFormatException e) {
         throw new IllegalArgumentException(
-            "BENCHMARK_SIZES must hold positive ints, got: " + raw, e);
+            "PRODUCER_COUNTS must hold positive ints, got: " + raw, e);
       }
-      if (size <= 0) {
-        throw new IllegalArgumentException("BENCHMARK_SIZES must hold positive ints: " + raw);
+      if (count <= 0) {
+        throw new IllegalArgumentException("PRODUCER_COUNTS must hold positive ints: " + raw);
       }
-      sizes.add(size);
+      counts.add(count);
     }
-    return sizes;
+    return counts;
   }
 
   private void readinessGates(AdminClient admin) throws Exception {
@@ -506,7 +549,7 @@ class ShoreBenchmarkTest {
   private long countDltSinceBeginning(String runId) {
     Properties props = new Properties();
     props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers());
-    props.put(ConsumerConfig.GROUP_ID_CONFIG, "bench-dlt-" + runId);
+    props.put(ConsumerConfig.GROUP_ID_CONFIG, "bench-conc-dlt-" + runId);
     props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
     props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
     props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
@@ -521,7 +564,7 @@ class ShoreBenchmarkTest {
    * Both columns use the same conversion, so the receive-latency delta stays exact.
    */
   private static long toEpochMilli(Object value) {
-    if (value instanceof Timestamp ts) {
+    if (value instanceof java.sql.Timestamp ts) {
       return ts.getTime();
     }
     if (value instanceof LocalDateTime ldt) {
@@ -570,7 +613,8 @@ class ShoreBenchmarkTest {
     return matched;
   }
 
-  private Map<String, Double> snapshotCounters() {    Map<String, Double> snap = new LinkedHashMap<>();
+  private Map<String, Double> snapshotCounters() {
+    Map<String, Double> snap = new LinkedHashMap<>();
     snap.put("mqtt_received_total", metrics.getMqttReceivedTotal().count());
     snap.put("mqtt_invalid_total", metrics.getMqttInvalidTotal().count());
     snap.put("kafka_produced_total", metrics.getKafkaProducedTotal().count());

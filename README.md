@@ -154,6 +154,28 @@ DLT 把“处理不了的消息”与“消费进度”解耦：原 offset 在 D
 环境：Java 17 / Linux 4 CPU；P50 系 RECEIVE 延迟（不含单条 insert/commit，
 不是 broker 延迟），完成吞吐才是持久化收敛标尺。三档一致性门全过。
 
+### 多 Producer 并发（P2-4.1.1）
+
+测试方法：固定总量（默认 10000 条），1 / 10 / 50 个独立 Edge 发布者并发上报。
+每个 producer 拥有独立 MQTT client、独立连接、独立 MMSI，不共享发送状态；
+消息 `n` 恒归属 producer `n % producerCount`，`msg_id` 确定可复现。
+链路与基线完全相同（MQTT → Mosquitto → 岸端服务 → Kafka → MySQL + Redis），
+禁止 mock、禁止直调 Consumer、禁止绕过 MQTT。
+
+```bash
+BENCHMARK_MODE=concurrent PRODUCER_COUNTS=1,10,50 MESSAGES=10000 mvn -Pbenchmark test
+```
+
+`BENCHMARK_MODE` 一次只选一个场景（`concurrent` 跑并发，缺省跑基线三档），
+现有 1k/10k/50k benchmark 不变。结果进 `target/benchmark-results/` 下的
+`concurrent-producer-results.{json,csv,md}`，与基线文件互不覆盖。
+
+指标定义：每档输出 producer 数、publish/history 吞吐、History RECEIVE 延迟
+P50/P95/P99（口径与基线一致）、MySQL 行数、Redis 键数、DLT 数、lost 数、
+`history_duplicate` 数。一致性门：行数 == 发送数、`DISTINCT(msg_id)` 相等、
+lost 为 0、DLT 为 0、Redis 每键最终态正确。同样只是单机 Docker 基线，
+不是生产容量证明。
+
 ## 6. Fault Injection
 
 详见 [`docs/FAULT_INJECTION.md`](docs/FAULT_INJECTION.md)。
