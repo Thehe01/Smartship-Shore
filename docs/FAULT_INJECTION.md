@@ -12,7 +12,7 @@
 | P2-4.2.3 | MySQL 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动落库，B 正常落库 | ✅ CI 已绿（[Run 35677646998](https://github.com/Thehe01/Smartship-Shore/actions/runs/35677646998)） |
 | P2-4.2.4 | Redis 持续故障 → DLT | retry 耗尽 → A 进 DLT，恢复后 A 不自动投影，B 正常 | ✅ CI 已绿（[Run 35679570625](https://github.com/Thehe01/Smartship-Shore/actions/runs/35679570625)） |
 | P2-4.2.5 | Kafka 短暂故障 → MQTT QoS1 重投 | 重投循环 → 恢复后单行落库，DLT 0 | ✅ CI 已绿（[Run 35681578037](https://github.com/Thehe01/Smartship-Shore/actions/runs/35681578037)） |
-| P2-4.2.6 | Shore crash/restart → replay + 幂等 | 待做 | ⬜ |
+| P2-4.2.6 | Shore crash/restart → replay + 幂等 | 重投被去重吸收，B 正常，DLT 0 | 🟡 代码完成，CI 待验 |
 
 ## P2-4.2.1 MySQL transient outage
 
@@ -132,4 +132,26 @@
 - **验收**：`mqtt_received` 增量 ≥ 2、`rows == 1`、`DISTINCT(msg_id) == 1`、
   `history_persisted` 增量 == 1、`kafka_produced` 增量 ≥ 1、
   DLT 两 bucket 为 0 且 DLT topic snapshot 为 0、Redis payload/TTL 正确、
+  `lost == 0`。
+
+## P2-4.2.6 Shore crash/restart → replay + 幂等（代码完成，CI 待验）
+
+用例：`com.smartship.shore.fault.ShoreRestartReplayTest`
+（Kafka + MySQL + Mosquitto + Redis 全真实容器；无基础设施被冻，
+故障就是 shore 自己倒下又起来）。
+
+- **等价性说明**（诚实项）：真 kill -9 落在 insert→commit 窗口时，history 组
+  的可观测状态恰是“已落库记录因 offset 未提交而重投”。拿真 kill 赌纳秒窗口
+  是 timing roulette，故用 `AdminClient.alterConsumerGroupOffsets` 把 history
+  组倒回开头——重投输入完全相同，吸收路径（`UNIQUE(msg_id)` →
+  `DuplicateKeyException` → 按成功 ack，永不 DLT）是 100% 生产代码。
+  无 mock，无生产改动。
+- **时序**（全 bounded wait）：ready 门全过 → 发布 A → 稳态（MySQL 1 行 +
+  Redis 已投影）→ 停 history 容器（等到 `!isRunning`，无活成员才改 offset，
+  防 race）→ 倒回开头并用 `listConsumerGroupOffsets` 回读确认（不盲信）→
+  重启容器（等到 running + 分区重新 assigned）。
+- **验收**：`history_duplicate` 增量 ≥ 1（重投被吸收的正证据）、重投后仍
+  `rows == 1` 且 `DISTINCT == 1`、重启后发 B 正常落库 + 投影
+  （`history_persisted` 增量 == 2：A 一次 + B 一次，重投永不二次 persist）、
+  DLT 两 bucket 为 0 且 DLT topic snapshot 为 0、Redis B payload/TTL 正确、
   `lost == 0`。
