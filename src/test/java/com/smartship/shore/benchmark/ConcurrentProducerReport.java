@@ -60,15 +60,18 @@ public class ConcurrentProducerReport {
 
   private String toCsv() {
     StringBuilder sb = new StringBuilder(
-        "producer_count,messages,type_count,publish_duration_ms,publish_throughput_msg_s,"
+        "producer_count,messages_per_producer,messages,type_count,"
+            + "publish_duration_ms,publish_throughput_msg_s,"
             + "history_completion_ms,history_throughput_msg_s,"
             + "history_receive_latency_p50_ms,history_receive_latency_p95_ms,"
             + "history_receive_latency_p99_ms,history_receive_latency_max_ms,"
+            + "max_lag_ms,recovery_time_ms,"
             + "redis_completion_ms,redis_expected_keys,"
             + "redis_actual_keys,mysql_rows,distinct_msg_ids,dlt_records,lost_messages,"
             + "duplicate_count\n");
     for (ConcurrentProducerResult r : results) {
       sb.append(r.producerCount).append(',')
+          .append(r.messagesPerProducer).append(',')
           .append(r.messages).append(',')
           .append(r.typeCount).append(',')
           .append(r.publishDurationMs).append(',')
@@ -79,6 +82,8 @@ public class ConcurrentProducerReport {
           .append(fmt(r.historyReceiveLatencyP95Ms)).append(',')
           .append(fmt(r.historyReceiveLatencyP99Ms)).append(',')
           .append(fmt(r.historyReceiveLatencyMaxMs)).append(',')
+          .append(fmt(r.maxLagMs)).append(',')
+          .append(r.recoveryTimeMs).append(',')
           .append(r.redisCompletionMs).append(',')
           .append(r.redisExpectedKeys).append(',')
           .append(r.redisActualKeys).append(',')
@@ -99,17 +104,21 @@ public class ConcurrentProducerReport {
         .append(environment.get("os")).append("` / CPUs: `")
         .append(environment.get("availableProcessors")).append("`\n");
     sb.append("- Config: `").append(configuration).append("`\n\n");
-    sb.append("| Producers | Messages | Publish msg/s | History msg/s | P50 ms | P95 ms | P99 ms"
+    sb.append("| Producers | Per producer | Messages | Publish msg/s | History msg/s"
+        + " | P50 ms | P95 ms | P99 ms | Max lag ms | Recovery ms"
         + " | Redis converge ms | MySQL rows | Redis keys | DLT | Lost | Duplicates |\n");
-    sb.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    sb.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for (ConcurrentProducerResult r : results) {
       sb.append("| ").append(r.producerCount)
+          .append(" | ").append(r.messagesPerProducer)
           .append(" | ").append(r.messages)
           .append(" | ").append(fmt(r.publishThroughputMsgS))
           .append(" | ").append(fmt(r.historyThroughputMsgS))
           .append(" | ").append(fmt(r.historyReceiveLatencyP50Ms))
           .append(" | ").append(fmt(r.historyReceiveLatencyP95Ms))
           .append(" | ").append(fmt(r.historyReceiveLatencyP99Ms))
+          .append(" | ").append(fmt(r.maxLagMs))
+          .append(" | ").append(r.recoveryTimeMs)
           .append(" | ").append(r.redisCompletionMs)
           .append(" | ").append(r.mysqlRows)
           .append(" | ").append(r.redisActualKeys).append('/').append(r.redisExpectedKeys)

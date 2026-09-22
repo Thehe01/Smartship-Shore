@@ -1,14 +1,22 @@
 name: benchmark
 
-# Manual baseline runs only. Never triggered by push/PR and never part of the
+# Manual benchmark runs only. Never triggered by push/PR and never part of the
 # normal CI: deterministic workload against real Docker infrastructure via
 # Testcontainers, results uploaded as artifacts. Re-dispatch manually on
 # transient infrastructure flakes (e.g. Maven Central 429 on a cold cache).
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Benchmark scenario: baseline size sweep or concurrent producers'
+        required: false
+        default: 'baseline'
+        type: choice
+        options:
+          - baseline
+          - concurrent
       sizes:
-        description: 'Benchmark sizes, comma-separated (e.g. 1000 or 1000,10000,50000)'
+        description: 'Baseline sizes, comma-separated (e.g. 1000 or 1000,10000,50000)'
         required: false
         default: '1000'
         type: string
@@ -16,7 +24,10 @@ on:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The concurrent scenario drains up to 2.5M messages through a
+    # single-threaded history consumer; the baseline sweep never needs this
+    # much, but one shared cap keeps the workflow simple.
+    timeout-minutes: 300
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,18 +40,36 @@ jobs:
           cache: maven
 
       # The benchmark Maven profile runs ONLY @Tag("benchmark") tests; the
-      # plain suite stays untouched by this job.
+      # plain suite stays untouched by this job. BENCHMARK_MODE selects exactly
+      # one scenario inside the profile (the other aborts via assumption).
       - name: Run baseline benchmark
+        if: ${{ inputs.mode != 'concurrent' }}
         run: BENCHMARK_SIZES='${{ inputs.sizes }}' mvn -B -Pbenchmark test
+
+      - name: Run concurrent-producer benchmark
+        if: ${{ inputs.mode == 'concurrent' }}
+        run: >
+          BENCHMARK_MODE=concurrent
+          PRODUCER_COUNTS=1,10,50
+          MESSAGES_PER_PRODUCER=50000
+          mvn -B -Pbenchmark test
 
       - name: Publish results to job summary
         if: always()
         run: |
-          if [ ! -f target/benchmark-results/benchmark-results.md ]; then
+          found=0
+          if [ -f target/benchmark-results/benchmark-results.md ]; then
+            cat target/benchmark-results/benchmark-results.md >> "$GITHUB_STEP_SUMMARY"
+            found=1
+          fi
+          if [ -f target/benchmark-results/concurrent-producer-results.md ]; then
+            cat target/benchmark-results/concurrent-producer-results.md >> "$GITHUB_STEP_SUMMARY"
+            found=1
+          fi
+          if [ "$found" = 0 ]; then
             echo "FAIL: no benchmark results produced"
             exit 1
           fi
-          cat target/benchmark-results/benchmark-results.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark results
         if: always()

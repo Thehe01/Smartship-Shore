@@ -12,6 +12,7 @@ public class ConcurrentProducerResult {
 
   public String runId;
   public int producerCount;
+  public int messagesPerProducer;
   public int messages;
   public int typeCount;
   public long publishDurationMs;
@@ -22,6 +23,8 @@ public class ConcurrentProducerResult {
   public double historyReceiveLatencyP95Ms;
   public double historyReceiveLatencyP99Ms;
   public double historyReceiveLatencyMaxMs;
+  public double maxLagMs;
+  public long recoveryTimeMs;
   public long redisCompletionMs;
   public int redisExpectedKeys;
   public int redisActualKeys;

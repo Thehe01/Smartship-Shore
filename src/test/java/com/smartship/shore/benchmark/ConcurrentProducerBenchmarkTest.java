@@ -82,7 +82,7 @@ import org.testcontainers.utility.MountableFile;
 })
 class ConcurrentProducerBenchmarkTest {
 
-  private static final int DEFAULT_MESSAGES = 10000;
+  private static final int DEFAULT_MESSAGES_PER_PRODUCER = 50000;
   private static final String DEFAULT_COUNTS = "1,10,50";
   private static final int PUBLISH_WINDOW = 200;
 
@@ -160,11 +160,11 @@ class ConcurrentProducerBenchmarkTest {
   void concurrentBenchmark() throws Exception {
     Assumptions.assumeTrue("concurrent".equalsIgnoreCase(System.getenv("BENCHMARK_MODE")),
         "BENCHMARK_MODE=concurrent selects the concurrent-producer scenario");
-    int messages = parseMessages();
+    int messagesPerProducer = parseMessagesPerProducer();
     List<Integer> counts = parseCounts();
     Map<String, Object> config = new LinkedHashMap<>();
     config.put("mode", "concurrent");
-    config.put("messages", messages);
+    config.put("messagesPerProducer", messagesPerProducer);
     config.put("producerCounts", counts);
     config.put("types", BenchmarkWorkload.TYPES);
     config.put("rawTopic", properties.getKafka().getRawTopic());
@@ -184,6 +184,10 @@ class ConcurrentProducerBenchmarkTest {
         + " HistoryConsumer receive/processing timestamp; they exclude per-row MySQL"
         + " insert/commit time and are not Kafka broker latencies. Batch persistence"
         + " convergence is measured by history completion/throughput instead.");
+    report.notes.add("maxLagMs is the worst per-message receive latency (the longest any"
+        + " single message waited end to end); recoveryTimeMs is the history completion"
+        + " time (first send until MySQL holds every row, i.e. backlog drain time)."
+        + " Dedicated offset-lag sampling is a later phase, not this one.");
     report.notes.add("Redis per-message latency is not measured: latest-state"
         + " projection keeps no per-message consume time.");
     report.notes.add("Single-machine Docker/Testcontainers baseline only: not a production"
@@ -198,7 +202,7 @@ class ConcurrentProducerBenchmarkTest {
       for (int producerCount : counts) {
         String runId = "c" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         runIds.add(runId);
-        ConcurrentProducerResult result = runCase(runId, producerCount, messages);
+        ConcurrentProducerResult result = runCase(runId, producerCount, messagesPerProducer);
         report.results.add(result);
       }
       report.configuration.put("runIds", runIds);
@@ -212,11 +216,13 @@ class ConcurrentProducerBenchmarkTest {
   }
 
   // ------------------------------------------------------------------
-  // One measured case: producerCount independent publishers, messages total.
+  // One measured case: producerCount independent publishers,
+  // messagesPerProducer each (messages total = producerCount * perProducer).
   // ------------------------------------------------------------------
 
-  private ConcurrentProducerResult runCase(String runId, int producerCount, int messages)
-      throws Exception {
+  private ConcurrentProducerResult runCase(String runId, int producerCount,
+      int messagesPerProducer) throws Exception {
+    final int messages = producerCount * messagesPerProducer;
     // Isolation: no reliance on previous rounds or container leftovers.
     jdbcTemplate.execute("TRUNCATE TABLE ship_telemetry_history");
     redisTemplate.execute((RedisCallback<Object>) connection -> {
@@ -323,6 +329,7 @@ class ConcurrentProducerBenchmarkTest {
     ConcurrentProducerResult r = new ConcurrentProducerResult();
     r.runId = runId;
     r.producerCount = producerCount;
+    r.messagesPerProducer = messagesPerProducer;
     r.messages = messages;
     r.typeCount = BenchmarkWorkload.TYPES.size();
     r.publishDurationMs = (publishDone - firstSendStart) / 1_000_000;
@@ -334,6 +341,10 @@ class ConcurrentProducerBenchmarkTest {
     r.historyReceiveLatencyP99Ms = BenchmarkResult.percentile(latencies, 99);
     r.historyReceiveLatencyMaxMs =
         latencies.length == 0 ? Double.NaN : latencies[latencies.length - 1];
+    // Lag outputs derived from already-collected data (no dedicated lag sampler
+    // this phase): worst per-message delay + backlog drain time. See report notes.
+    r.maxLagMs = r.historyReceiveLatencyMaxMs;
+    r.recoveryTimeMs = r.historyCompletionMs;
     r.redisCompletionMs = (redisDone - firstSendStart) / 1_000_000;
     r.redisExpectedKeys = expected.size();
     r.redisActualKeys = (int) actualKeys;
@@ -435,22 +446,23 @@ class ConcurrentProducerBenchmarkTest {
     return expected;
   }
 
-  private static int parseMessages() {
-    String raw = System.getenv("MESSAGES");
+  private static int parseMessagesPerProducer() {
+    String raw = System.getenv("MESSAGES_PER_PRODUCER");
     if (raw == null || raw.isBlank()) {
-      return DEFAULT_MESSAGES;
+      return DEFAULT_MESSAGES_PER_PRODUCER;
     }
-    final int messages;
+    final int perProducer;
     try {
-      messages = Integer.parseInt(raw.trim());
+      perProducer = Integer.parseInt(raw.trim());
     } catch (NumberFormatException e) {
       throw new IllegalArgumentException(
-          "MESSAGES must hold a positive int, got: " + raw, e);
+          "MESSAGES_PER_PRODUCER must hold a positive int, got: " + raw, e);
     }
-    if (messages <= 0) {
-      throw new IllegalArgumentException("MESSAGES must hold a positive int: " + raw);
+    if (perProducer <= 0) {
+      throw new IllegalArgumentException(
+          "MESSAGES_PER_PRODUCER must hold a positive int: " + raw);
     }
-    return messages;
+    return perProducer;
   }
 
   private static List<Integer> parseCounts() {
