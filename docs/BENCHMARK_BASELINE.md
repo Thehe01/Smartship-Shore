@@ -21,20 +21,35 @@
 | 1000 | 1769.91 | 245.10 | 2119 | 3001 | 3064 | 4242 | 1000/1000 | 500/500 | 0 | 0 | `d9cb088` | [Run 35618393537](https://github.com/Thehe01/Smartship-Shore/actions/runs/35618393537) |
 | 10000 | 2435.46 | 360.46 | 17431 | 22971 | 23347 | 27910 | 10000/10000 | 500/500 | 0 | 0 | `e5b5f1c` | [Run 35622631909](https://github.com/Thehe01/Smartship-Shore/actions/runs/35622631909) |
 | 50000 | 3078.63 | 465.70 | 54784 | 87159 | 90397 | 107745 | 50000/50000 | 500/500 | 0 | 0 | `e5b5f1c` | [Run 35623305798](https://github.com/Thehe01/Smartship-Shore/actions/runs/35623305798) |
-| 2000000 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 | 2000000/2000000 | 待补 | 0 | 0 | `079fa9f` | [Run 35693319147](https://github.com/Thehe01/Smartship-Shore/actions/runs/35693319147) |
+| 2000000 | 3118.22 | 523.96 | 1805660 | 3066056 | 3171124 | 3823368 | 2000000/2000000 | 500/500 | 0 | 0 | `079fa9f` | [Run 35693319147](https://github.com/Thehe01/Smartship-Shore/actions/runs/35693319147) |
 
-- 2M 档：CI 结论 success（约 65 分钟，与 ~500msg/s 排空估算一致），一致性门
-  全过（行数/`DISTINCT`/lost/DLT），数值表待 artifact 解压回填——artifact
-  下载需鉴权，未经手传数字，不编造。
+- 2M 档（run [#35693319147](https://github.com/Thehe01/Smartship-Shore/actions/runs/35693319147)，
+  约 65 分钟）：History 吞吐 523.96，延续 245 → 360 → 466 → 524 的随量反升；
+  一致性门全过。P50/P99 量级为分钟（burst 排空形态，口径仍是 RECEIVE 延迟）。
 
 ## 并发场景（P2-4.1.1：1 / 10 / 50 producers × 50k）
 
-- 方法：每 producer 固定 50000 条，总量 50k / 500k / 2.5M；独立 client/连接/MMSI，
-  `msg_id` 确定可复现；链路与基线相同；结果进
-  `concurrent-producer-results.{json,csv,md}`。
-- 口径：吞吐/延迟/一致性门与基线一致；另记 max lag（最坏单条延迟）与
-  recovery time（首发到收齐）；独立 offset-lag 采样是后续专项，本阶段不做。
-- 结果：待首个绿 run 回填（workflow `mode=concurrent` 一键 dispatch）。
+run [#35707506141](https://github.com/Thehe01/Smartship-Shore/actions/runs/35707506141)
+（`46d1d3b`，`mode=concurrent`，约 4h18m，success；harness commit `46d1d3b`）：
+
+| Producers | Per producer | Messages | Publish msg/s | History msg/s | P50 ms | P95 ms | P99 ms | Max lag ms | Recovery ms | Redis converge ms | MySQL rows | Redis keys | DLT | Lost | Duplicates |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 50000 | 50000 | 4058.44 | 159.34 | 140425 | 284264 | 296277 | 301244 | 313798 | 314044 | 50000 | 5/5 | 0 | 0 | 0.00 |
+| 10 | 50000 | 500000 | 17039.84 | 195.42 | 1296332 | 2428811 | 2513801 | 2529184 | 2558598 | 2559789 | 500000 | 50/50 | 0 | 0 | 0.00 |
+| 50 | 50000 | 2500000 | 18797.84 | 201.05 | 6510108 | 11717702 | 12181916 | 12301192 | 12434891 | 12440747 | 2500000 | 250/250 | 0 | 0 | 0.00 |
+
+- 一致性门三档全过：行数/`DISTINCT` 相等、lost/DLT/duplicates 全零、
+  Redis 键数精确（5/5、50/50、250/250）且每键最终态正确。
+- 方法：每 producer 独立 client/连接/MMSI，消息 `n` 恒归属 `n % P`，
+  `msg_id` 确定可复现；结果进 `concurrent-producer-results.{json,csv,md}`；
+  max lag = 最坏单条延迟，recovery = 首发到收齐（独立 offset-lag 采样是后续专项）。
+- Publish 随 producer 数 4k → 17k → 18.8k：ingest 侧并行真实。
+- History 160–201，低于同总量基线 50k 的 466——**冷热混杂，不归因于并发**：
+  并发 P=1 跑在最前且无 warm-up，基线 50k 跑在第三；两 run 内部都递增
+ （159 → 195 → 201；245 → 360 → 466）。分离变量需同暖度对照，未做，
+  不下因果断言。
+- 延迟随 backlog 线性涨（P50 ≈ 半程，P99/max lag 贴尾部，recovery ≈ 排空完成），
+  与基线同一排队形状。
 - 同样只是单机 Docker 基线，不是生产容量证明。
 
 - 三档一致性门全过：行数 == 发送数、`DISTINCT msg_id` 相等、Redis 每键
