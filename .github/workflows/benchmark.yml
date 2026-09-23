@@ -8,13 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Benchmark scenario: baseline size sweep or concurrent producers'
+        description: 'Benchmark scenario: baseline sweep, concurrent producers, or soak'
         required: false
         default: 'baseline'
         type: choice
         options:
           - baseline
           - concurrent
+          - soak
       sizes:
         description: 'Baseline sizes, comma-separated (e.g. 1000 or 1000,10000,50000)'
         required: false
@@ -41,9 +42,9 @@ jobs:
 
       # The benchmark Maven profile runs ONLY @Tag("benchmark") tests; the
       # plain suite stays untouched by this job. BENCHMARK_MODE selects exactly
-      # one scenario inside the profile (the other aborts via assumption).
+      # one scenario inside the profile (the others abort via assumption).
       - name: Run baseline benchmark
-        if: ${{ inputs.mode != 'concurrent' }}
+        if: ${{ inputs.mode == 'baseline' }}
         run: BENCHMARK_SIZES='${{ inputs.sizes }}' mvn -B -Pbenchmark test
 
       - name: Run concurrent-producer benchmark
@@ -52,6 +53,16 @@ jobs:
           BENCHMARK_MODE=concurrent
           PRODUCER_COUNTS=1,10,50
           MESSAGES_PER_PRODUCER=50000
+          mvn -B -Pbenchmark test
+
+      - name: Run sustained-pressure soak benchmark
+        if: ${{ inputs.mode == 'soak' }}
+        run: >
+          BENCHMARK_MODE=soak
+          SOAK_SHIPS=50
+          SOAK_POINTS_PER_SEC=50
+          SOAK_STEADY_PER_PRODUCER=9000
+          SOAK_OUTAGE_PER_PRODUCER=15000
           mvn -B -Pbenchmark test
 
       - name: Publish results to job summary
@@ -64,6 +75,10 @@ jobs:
           fi
           if [ -f target/benchmark-results/concurrent-producer-results.md ]; then
             cat target/benchmark-results/concurrent-producer-results.md >> "$GITHUB_STEP_SUMMARY"
+            found=1
+          fi
+          if [ -f target/benchmark-results/soak-results.md ]; then
+            cat target/benchmark-results/soak-results.md >> "$GITHUB_STEP_SUMMARY"
             found=1
           fi
           if [ "$found" = 0 ]; then

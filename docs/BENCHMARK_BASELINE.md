@@ -52,6 +52,17 @@ run [#35707506141](https://github.com/Thehe01/Smartship-Shore/actions/runs/35707
   与基线同一排队形状。
 - 同样只是单机 Docker 基线，不是生产容量证明。
 
+## 定速压测 + 断网补传（soak，待首个绿 run 回填）
+
+- 方法：N 艘船定速上报（默认 50 船 × 50 点/秒），总量固定（A 段每产 9000 +
+  B 段每产 15000，共 1.2M）；A 段在线收流 → 停岸端订阅（断网，发布者继续发，
+  broker 为 durable 会话排队）→ B 段发入断网期（5 分钟由固定总量自然形成，
+  期间断言 MySQL 冻结）→ 重连排空；结果进 `soak-results.{json,csv,md}`。
+- 口径：实际发布速率、publish/history 吞吐、RECEIVE 延迟 P50/P95/P99/max
+ （含排队等待）、断网期积压数、补传排空耗时；门为行数/`DISTINCT`/lost/DLT/
+  Redis 最终态。
+- 同样只是单机 Docker 基线，不是生产容量证明。
+
 - 三档一致性门全过：行数 == 发送数、`DISTINCT msg_id` 相等、Redis 每键
   timestamp/msg_id 等于输入最新事件、stale == 0、DLT == 0、lost == 0
 

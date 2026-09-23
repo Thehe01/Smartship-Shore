@@ -167,8 +167,8 @@ BENCHMARK_MODE=concurrent PRODUCER_COUNTS=1,10,50 MESSAGES_PER_PRODUCER=50000 \
   mvn -Pbenchmark test
 ```
 
-`BENCHMARK_MODE` 一次只选一个场景（`concurrent` 跑并发，缺省跑基线档），
-现有 1k/10k/50k/2M baseline 不变。GitHub Actions `benchmark` workflow 也有同名
+`BENCHMARK_MODE` 一次只选一个场景（`concurrent` 跑并发，`soak` 跑定速压测，
+缺省跑基线档），现有 1k/10k/50k/2M baseline 不变。GitHub Actions `benchmark` workflow 也有同名
 `mode` 输入（默认 `baseline`，现有 dispatch 行为逐字不变）。
 结果进 `target/benchmark-results/` 下的
 `concurrent-producer-results.{json,csv,md}`，与基线文件互不覆盖。
@@ -178,6 +178,28 @@ P50/P95/P99（口径与基线一致）、max lag（最坏单条延迟）与 reco
 （首发到 MySQL 收齐，即 backlog 排空时间；独立 offset-lag 采样是后续专项，
 本阶段不做）、MySQL 行数、Redis 键数、DLT 数、lost 数、`history_duplicate` 数。
 一致性门：行数 == 发送数、`DISTINCT(msg_id)` 相等、lost 为 0、DLT 为 0、
+Redis 每键最终态正确。同样只是单机 Docker 基线，不是生产容量证明。
+
+### 定速压测 + 断网补传（soak）
+
+测试方法：N 艘船定速上报（如 50 船 × 50 点/秒），总量固定（定速只是上限，
+总数精确、时长实测）。分三段：A 段岸端在线定速收流；随后停掉岸端 MQTT 订阅
+（断网开始——发布者继续向 Mosquitto 发，broker 为 durable 会话排队 QoS1）；
+B 段继续定速发入断网期（5 分钟时长由固定总量自然形成，非 sleep 常数），
+期间断言 MySQL 行数冻结；重连后排空积压（补传），测 p99/端到端延迟与补传丢失。
+
+```bash
+BENCHMARK_MODE=soak SOAK_SHIPS=50 SOAK_POINTS_PER_SEC=50 \
+  SOAK_STEADY_PER_PRODUCER=9000 SOAK_OUTAGE_PER_PRODUCER=15000 \
+  mvn -Pbenchmark test
+```
+
+`BENCHMARK_MODE=soak` 与基线/并发互斥（assumption 门控，一次只跑一个场景）。
+结果进 `target/benchmark-results/soak-results.{json,csv,md}`。
+指标：实际发布速率、publish/history 吞吐、History RECEIVE 延迟 P50/P95/P99/max
+（积压下含排队等待，口径与基线一致）、断网期积压数、补传排空耗时、
+MySQL 行数、Redis 键数、DLT/lost/duplicates。
+一致性门：行数/`DISTINCT` == 发送总数、lost 为 0、DLT 为 0、
 Redis 每键最终态正确。同样只是单机 Docker 基线，不是生产容量证明。
 
 ## 6. Fault Injection
