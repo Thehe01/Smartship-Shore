@@ -82,6 +82,9 @@ public class TelemetryMessageParser {
 
     Instant timestamp = coerceInstant(flat.get("timestamp"));
     Instant sentAt = coerceInstant(flat.get("sent_at"));
+    // Edge row id for Application ACK echo. Stays in data as well (a view, not a
+    // move); null when the row carries no id — the ACK then matches on msg_id alone.
+    String seq = text(flat.get("id"));
 
     Map<String, Object> data = new LinkedHashMap<>();
     flat.forEach((k, v) -> {
@@ -96,6 +99,7 @@ public class TelemetryMessageParser {
         .type(type)
         .timestamp(timestamp)
         .sentAt(sentAt)
+        .seq(seq)
         .data(data)
         .build();
   }

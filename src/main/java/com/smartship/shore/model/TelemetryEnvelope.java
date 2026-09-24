@@ -49,6 +49,15 @@ public class TelemetryEnvelope {
   @JsonProperty("sent_at")
   private Instant sentAt;
 
+  /**
+   * Edge source row id (the {@code id} column Edge cursors advance on), echoed
+   * transparently in the Application ACK so Edge can match ACKs to rows. Never
+   * interpreted by shore; may be absent for schemaless rows. Kept in
+   * {@link #data} as well — this field is a view, not a move.
+   */
+  @JsonProperty("seq")
+  private String seq;
+
   /** Remaining business columns, verbatim from the Edge payload. Never null (may be empty). */
   @JsonProperty("data")
   @Builder.Default

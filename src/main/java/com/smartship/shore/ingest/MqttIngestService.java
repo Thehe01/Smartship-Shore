@@ -52,6 +52,7 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
   private final TelemetryMessageParser parser;
   private final TelemetryKafkaProducer producer;
   private final ShoreMetrics metrics;
+  private volatile MqttAckPublisher ackPublisher;
 
   private final AtomicBoolean running = new AtomicBoolean(false);
   private volatile MqttClient client;
@@ -61,17 +62,38 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
   /** Coalesces forced reconnects when consecutive handoffs fail. */
   private final AtomicBoolean redeliveryReconnectPending = new AtomicBoolean(false);
 
+  @org.springframework.beans.factory.annotation.Autowired
+  public MqttIngestService(
+      ShoreProperties properties,
+      TelemetryMessageParser parser,
+      TelemetryKafkaProducer producer,
+      ShoreMetrics metrics,
+      MqttAckPublisher ackPublisher) {    this.properties = properties;
+    this.parser = parser;
+    this.producer = producer;
+    this.metrics = metrics;
+    this.ackPublisher = ackPublisher;
+    // Eager executor so the redelivery-reconnect path never depends on start() timing.
+    this.starter = newStarter();
+  }
+
+  /**
+   * Legacy construction for unit tests: builds the default Application ACK publisher.
+   * Production wiring uses the 5-arg constructor via Spring.
+   */
   public MqttIngestService(
       ShoreProperties properties,
       TelemetryMessageParser parser,
       TelemetryKafkaProducer producer,
       ShoreMetrics metrics) {
-    this.properties = properties;
-    this.parser = parser;
-    this.producer = producer;
-    this.metrics = metrics;
-    // Eager executor so the redelivery-reconnect path never depends on start() timing.
-    this.starter = newStarter();
+    this(properties, parser, producer, metrics,
+        new MqttAckPublisher(properties, new com.fasterxml.jackson.databind.ObjectMapper(),
+            metrics));
+  }
+
+  /** Test hook: replaces the Application ACK publisher (e.g. with a mock). */
+  void setAckPublisherForTests(MqttAckPublisher ackPublisher) {
+    this.ackPublisher = ackPublisher;
   }
 
   private static ScheduledExecutorService newStarter() {
@@ -269,6 +291,15 @@ public class MqttIngestService implements MqttCallbackExtended, IMqttMessageList
       // hold the MQTT acknowledgment here so QoS1 redelivers the original message.
       handoffFailed(envelope, e.getCause() != null ? e.getCause().toString() : e.toString());
       return;
+    }
+    // Kafka durable handoff confirmed (acks=all): emit the Application ACK for Edge's
+    // persistent cursor, then acknowledge the original MQTT delivery. The ACK publish
+    // is best-effort and never throws — a lost ACK only costs Edge one resend,
+    // absorbed by UNIQUE(msg_id). On Kafka failure above we never reach here:
+    // no Application ACK, no MQTT acknowledgment, redelivery path unchanged.
+    MqttAckPublisher publisher = ackPublisher;
+    if (publisher != null) {
+      publisher.publishAck(envelope.getMmsi(), envelope.getMsgId(), envelope.getSeq());
     }
     completeDelivery(message);
   }

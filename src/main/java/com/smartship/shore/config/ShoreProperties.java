@@ -57,6 +57,19 @@ public class ShoreProperties {
      * so the broker redelivers it.
      */
     private long kafkaHandoffTimeoutMs = 5000L;
+    /**
+     * Application ACK master switch ({@code shore.mqtt.ack-enabled}, default true).
+     * When false, shore never publishes {@code ship/{mmsi}/ack} (used by tests and
+     * by deployments whose Edge fleet has not opted into Kafka-durable ACKs yet).
+     */
+    private boolean ackEnabled = true;
+    /**
+     * Bounded wait for one Application ACK publish ({@code shore.mqtt.ack-timeout-ms},
+     * default 3s). Best-effort only: expiry is logged and counted, never thrown —
+     * the Kafka record is already durable, and Edge resends on ACK timeout with the
+     * duplicate absorbed by {@code UNIQUE(msg_id)}.
+     */
+    private long ackTimeoutMs = 3000L;
   }
 
   @Data

@@ -28,6 +28,8 @@ public class ShoreMetrics {
 
   private final Counter kafkaProducedTotal;
   private final Counter kafkaProduceFailedTotal;
+  private final Counter kafkaAckPublishedTotal;
+  private final Counter kafkaAckFailedTotal;
 
   private final Counter historyConsumedTotal;
   private final Counter historyPersistedTotal;
@@ -61,6 +63,15 @@ public class ShoreMetrics {
     this.kafkaProduceFailedTotal =
         Counter.builder("smartship_shore_kafka_produce_failed_total")
             .description("Envelopes rejected by Kafka (async send failure)")
+            .register(registry);
+    this.kafkaAckPublishedTotal =
+        Counter.builder("smartship_shore_kafka_ack_published_total")
+            .description("Application ACKs published to ship/{mmsi}/ack after Kafka acks=all")
+            .register(registry);
+    this.kafkaAckFailedTotal =
+        Counter.builder("smartship_shore_kafka_ack_failed_total")
+            .description("Application ACK publishes that failed or timed out (Edge resends;"
+                + " the Kafka record itself is already durable)")
             .register(registry);
     this.historyConsumedTotal =
         Counter.builder("smartship_shore_history_consumed_total")
@@ -111,6 +122,14 @@ public class ShoreMetrics {
 
   public void kafkaProduceFailed() {
     kafkaProduceFailedTotal.increment();
+  }
+
+  public void kafkaAckPublished() {
+    kafkaAckPublishedTotal.increment();
+  }
+
+  public void kafkaAckFailed() {
+    kafkaAckFailedTotal.increment();
   }
 
   public void historyConsumed() {

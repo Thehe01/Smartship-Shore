@@ -68,6 +68,9 @@ Kafka 负责岸端持久化、可回放、可多订阅——再加一个消费�
   `cleanSession=false` 重连，让 broker 重投原 QoS1 消息。
 - Paho 回调线程串行，有界等待使 ACK 顺序恒等于到达顺序；故意丢弃的毒消息照常
   ACK，避免单条坏消息在 broker 上无限循环。
+- Kafka `acks=all` 落定后向 `ship/{mmsi}/ack` 回 Application ACK
+  （`{msg_id, seq, KAFKA_COMMITTED}`），Edge 凭它推进持久化游标；
+  PUBACK 只代表 Broker 收到。详见 [`docs/APPLICATION_ACK.md`](docs/APPLICATION_ACK.md)。
 
 ### 3.2 Kafka 可靠消费
 
