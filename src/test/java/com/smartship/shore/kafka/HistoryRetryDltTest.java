@@ -3,6 +3,7 @@ package com.smartship.shore.kafka;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -42,7 +43,9 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabase;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseBuilder;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType;
+import org.springframework.kafka.listener.BatchListenerFailedException;
 import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.kafka.listener.ListenerExecutionFailedException;
 import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.kafka.support.KafkaHeaders;
@@ -349,6 +352,32 @@ class HistoryRetryDltTest {
     ProducerRecord<String, String> dlt = singleDltSend();
     assertEquals(json, dlt.value(), "original payload preserved verbatim");
     assertEquals(0.0, metrics.retryCount("transient"));
+    assertEquals(1.0, metrics.dltCount("poison"));
+  }
+
+  @Test
+  @DisplayName("Container-shaped LEFE(BLFE(root)) → DLT keeps wrapper fqcn + root cause-fqcn")
+  void containerWrappedBatchFailureKeepsHeaderContract() {
+    // The real batch container wraps the listener's BatchListenerFailedException in a
+    // ListenerExecutionFailedException before the error handler sees it. The DLT must
+    // still name the Spring wrapper outside and the shore root cause inside — exactly
+    // the contract HistoryDltTestcontainersTest asserts against real containers.
+    ConsumerRecord<String, String> rec = record("413999999", "{not-json-at-all");
+    try {
+      consumer.listenBatch(List.of(rec), new TestAck());
+      fail("poison must throw");
+    } catch (BatchListenerFailedException e) {
+      handler.handleOne(
+          new ListenerExecutionFailedException("Listener failed", "smartship-history", e),
+          rec, kafkaConsumer, container);
+    }
+
+    ProducerRecord<String, String> dlt = singleDltSend();
+    assertTrue(header(dlt, KafkaHeaders.DLT_EXCEPTION_FQCN)
+        .contains("ListenerExecutionFailedException"));
+    assertTrue(header(dlt, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN)
+        .contains("InvalidTelemetryException"));
+    assertEquals("poison", header(dlt, "shore-dlt-reason"));
     assertEquals(1.0, metrics.dltCount("poison"));
   }
 

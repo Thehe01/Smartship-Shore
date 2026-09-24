@@ -12,6 +12,7 @@ import java.util.Map;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.header.internals.RecordHeaders;
@@ -36,6 +37,8 @@ import org.springframework.kafka.listener.CommonErrorHandler;
 import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.kafka.listener.ListenerExecutionFailedException;
+import org.springframework.kafka.listener.RetryListener;
 import org.springframework.kafka.support.serializer.JsonSerializer;
 import org.springframework.util.backoff.FixedBackOff;
 
@@ -229,8 +232,19 @@ public class KafkaConfig {
         DataIntegrityViolationException.class,
         BadSqlGrammarException.class,
         InvalidDataAccessApiUsageException.class);
-    handler.setRetryListeners(
-        (record, ex, deliveryAttempt) -> metrics.historyRetry(ShoreMetrics.classify(ex)));
+    handler.setRetryListeners(new RetryListener() {
+      @Override
+      public void failedDelivery(ConsumerRecord<?, ?> record, Exception ex, int deliveryAttempt) {
+        metrics.historyRetry(ShoreMetrics.classify(ex));
+      }
+
+      @Override
+      public void failedDelivery(ConsumerRecords<?, ?> records, Exception ex, int deliveryAttempt) {
+        // Batch listener retries arrive here (the record overload stays a no-op default
+        // otherwise): one observation per failed batch delivery, same classification.
+        metrics.historyRetry(ShoreMetrics.classify(ex));
+      }
+    });
     // The original offset advances only after the DLT publish succeeds.
     handler.setCommitRecovered(true);
     return handler;
@@ -248,8 +262,37 @@ public class KafkaConfig {
    * {@code ListenerExecutionFailedException}, so without this the DLT headers would
    * name the reporting wrapper instead of the real failure. Classification and metrics
    * walk the whole cause chain and are unaffected either way.
+   *
+   * <p>Two container shapes, two outcomes — the DLT header contract is byte-identical
+   * to the single-record era in both:
+   * <ul>
+   *   <li>bare {@code BatchListenerFailedException} (direct listener call, unit tests)
+   *   → the root failure itself;</li>
+   *   <li>{@code ListenerExecutionFailedException → BatchListenerFailedException → root}
+   *   (real batch container) → a rebuilt outer {@code ListenerExecutionFailedException}
+   *   with the same message/groupId but the root as its cause, so
+   *   {@code exception-fqcn} still names the Spring wrapper and
+   *   {@code exception-cause-fqcn} names the shore exception that matters.</li>
+   * </ul>
    */
   private static Exception unwrapBatchFailure(Exception ex) {
+    if (ex instanceof ListenerExecutionFailedException outer) {
+      Exception current = ex;
+      boolean sawBatchWrapper = false;
+      while (current.getCause() instanceof Exception cause
+          && (cause instanceof ListenerExecutionFailedException
+              || cause instanceof org.springframework.kafka.listener.BatchListenerFailedException)) {
+        if (cause instanceof org.springframework.kafka.listener.BatchListenerFailedException) {
+          sawBatchWrapper = true;
+        }
+        current = cause;
+      }
+      if (sawBatchWrapper && current.getCause() instanceof Exception root) {
+        return new ListenerExecutionFailedException(
+            outer.getMessage(), outer.getGroupId(), root);
+      }
+      return ex;
+    }
     Exception current = ex;
     while (current instanceof org.springframework.kafka.listener.BatchListenerFailedException
         && current.getCause() instanceof Exception cause) {
