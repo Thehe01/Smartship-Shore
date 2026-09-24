@@ -52,15 +52,22 @@ run [#35707506141](https://github.com/Thehe01/Smartship-Shore/actions/runs/35707
   与基线同一排队形状。
 - 同样只是单机 Docker 基线，不是生产容量证明。
 
-## 定速压测 + 断网补传（soak，待首个绿 run 回填）
+## 定速压测 + 断网补传（soak：50 船 × 50 点/秒，本地 Docker 实跑已绿）
 
-- 方法：N 艘船定速上报（默认 50 船 × 50 点/秒），总量固定（A 段每产 9000 +
-  B 段每产 15000，共 1.2M）；A 段在线收流 → 停岸端订阅（断网，发布者继续发，
-  broker 为 durable 会话排队）→ B 段发入断网期（5 分钟由固定总量自然形成，
-  期间断言 MySQL 冻结）→ 重连排空；结果进 `soak-results.{json,csv,md}`。
-- 口径：实际发布速率、publish/history 吞吐、RECEIVE 延迟 P50/P95/P99/max
- （含排队等待）、断网期积压数、补传排空耗时；门为行数/`DISTINCT`/lost/DLT/
-  Redis 最终态。
+| Ships | Pts/s/ship | Messages | Achieved pub msg/s | History msg/s | P50 ms | P95 ms | P99 ms | Max ms | Outage backlog | Catch-up drain ms | Redis converge ms | MySQL rows | Redis keys | DLT | Lost | Duplicates |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50 | 50 | 1200000 | 1258.46 | 598.70 | 488846 | 1018041 | 1054896 | 1059265 | 750000 | 1050277 | 2006385 | 1200000 | 250/250 | 0 | 0 | 0.00 |
+
+- 方法：每 producer 独立 client/连接/MMSI，A 段每产 9000 + B 段每产 15000
+ （共 1.2M）；A 段在线收流 → 停岸端订阅（断网，发布者继续发，broker 为
+  durable 会话排队）→ B 段发入断网期（5 分钟由固定总量自然形成，期间断言
+  MySQL 冻结）→ 重连排空；结果进 `soak-results.{json,csv,md}`。
+- 一致性门全过：行数/`DISTINCT` == 1200000、lost/DLT/duplicates 全零、
+  Redis 250/250 且每键最终态正确——**断网 5 分钟零补传丢失**。
+- 断网期积压恰 750000（= B 段全部，A 段断网前已排空，冻结证据干净）。
+- History 598.7 是历次最高排空（大 backlog + 热机）；实际发布速率 1258
+ （定速是上限，QoS1 发布成本下如实记录，总数精确）。
+- P50 489s / P99 1055s / max 1059s：积压排队形态，与基线/并发同一形状。
 - 同样只是单机 Docker 基线，不是生产容量证明。
 
 - 三档一致性门全过：行数 == 发送数、`DISTINCT msg_id` 相等、Redis 每键
