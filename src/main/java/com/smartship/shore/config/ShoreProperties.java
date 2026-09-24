@@ -24,6 +24,7 @@ public class ShoreProperties {
   @PostConstruct
   public void validate() {
     kafka.validateDltTimeouts();
+    kafka.validateTopicDurability();
   }
 
   @Data
@@ -70,6 +71,15 @@ public class ShoreProperties {
      * duplicate absorbed by {@code UNIQUE(msg_id)}.
      */
     private long ackTimeoutMs = 3000L;
+    /**
+     * Bounded queue for the dedicated ACK publisher executor
+     * ({@code shore.mqtt.ack-queue-capacity}, default 200). One slow broker may hold
+     * at most 1 in-flight publish plus this many queued ACKs; overflow is rejected
+     * fast (counted, never thrown) and Edge resends on ACK timeout with the
+     * duplicate absorbed by {@code UNIQUE(msg_id)}. Bounds the pileup that an
+     * unbounded {@code CompletableFuture.runAsync} pool would accumulate.
+     */
+    private int ackQueueCapacity = 200;
   }
 
   @Data
@@ -94,6 +104,22 @@ public class ShoreProperties {
     private String groupId = "smartship-history";
     /** P2-3 consumer group projecting the raw topic into Redis latest-state hashes. */
     private String latestStateGroupId = "smartship-latest-state";
+    /**
+     * Topic replication factor for the raw topic. Local single-broker default is 1;
+     * production must set {@code KAFKA_RAW_TOPIC_REPLICAS=3} (or more) so that
+     * {@code acks=all} is a real quorum confirmation, not a single-copy write.
+     */
+    private int rawTopicReplicas = 1;
+    /**
+     * Topic replication factor for the DLT. Same rule as {@link #rawTopicReplicas}.
+     */
+    private int dltTopicReplicas = 1;
+    /**
+     * Topic-level {@code min.insync.replicas} enforced on both raw and DLT topics.
+     * Production: {@code KAFKA_MIN_INSYNC_REPLICAS=2} with replicas=3. Must be
+     * {@code >= 1} and {@code <= min(rawTopicReplicas, dltTopicReplicas)}.
+     */
+    private int minInsyncReplicas = 1;
 
     /**
      * Fail-fast invariant for the dead-letter producer tuning. Throws
@@ -106,6 +132,33 @@ public class ShoreProperties {
             "Illegal DLT producer timeouts: delivery.timeout.ms (" + dltDeliveryTimeoutMs
                 + ") must be >= request.timeout.ms (" + dltRequestTimeoutMs
                 + ") + linger.ms (" + dltLingerMs + ")");
+      }
+    }
+
+    /**
+     * Fail-fast invariant for topic durability tuning. The Application ACK contract
+     * ("KAFKA_COMMITTED means quorum-durable") only holds when the raw topic has
+     * real replicas; a single-copy {@code acks=all} is acknowledged here by refusing
+     * incoherent combinations, not by refusing single-copy outright (local dev stays
+     * bootable with replicas=1).
+     *
+     * <p>Rules: every factor {@code >= 1}; {@code minInsyncReplicas <=
+     * min(rawTopicReplicas, dltTopicReplicas)} so the broker can ever elect a
+     * writable ISR set.
+     */
+    public void validateTopicDurability() {
+      if (rawTopicReplicas < 1 || dltTopicReplicas < 1 || minInsyncReplicas < 1) {
+        throw new IllegalStateException(
+            "Illegal Kafka topic durability: replicas and min.insync.replicas must all be >= 1 "
+                + "(raw=" + rawTopicReplicas + ", dlt=" + dltTopicReplicas
+                + ", min.insync=" + minInsyncReplicas + ")");
+      }
+      int minReplicas = Math.min(rawTopicReplicas, dltTopicReplicas);
+      if (minInsyncReplicas > minReplicas) {
+        throw new IllegalStateException(
+            "Illegal Kafka topic durability: min.insync.replicas (" + minInsyncReplicas
+                + ") must be <= min(rawTopicReplicas, dltTopicReplicas) (" + minReplicas
+                + "), otherwise no ISR set can ever satisfy a write");
       }
     }
   }

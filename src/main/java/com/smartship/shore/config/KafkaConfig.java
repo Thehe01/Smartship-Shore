@@ -78,21 +78,29 @@ public class KafkaConfig {
 
   @Bean(name = RAW_TOPIC_BEAN)
   public NewTopic shipTelemetryRawTopic(ShoreProperties properties) {
-    // Single-broker local default replica factor; raise for real clusters.
-    return new NewTopic(
-        properties.getKafka().getRawTopic(),
-        properties.getKafka().getRawTopicPartitions(),
-        (short) 1);
+    // Replica factor is environment-tuned: 1 for local single-broker, >=3 for
+    // production so acks=all is a quorum write. Topic-level min.insync.replicas
+    // makes the broker itself reject under-replicated writes.
+    return org.springframework.kafka.config.TopicBuilder
+        .name(properties.getKafka().getRawTopic())
+        .partitions(properties.getKafka().getRawTopicPartitions())
+        .replicas(properties.getKafka().getRawTopicReplicas())
+        .config("min.insync.replicas",
+            String.valueOf(properties.getKafka().getMinInsyncReplicas()))
+        .build();
   }
 
   @Bean(name = DLT_TOPIC_BEAN)
   public NewTopic shipTelemetryDltTopic(ShoreProperties properties) {
     // Same partition count as raw so the default recoverer keeps the original partition
     // (and therefore per-MMSI order) inside the DLT.
-    return new NewTopic(
-        properties.getKafka().getDltTopic(),
-        properties.getKafka().getRawTopicPartitions(),
-        (short) 1);
+    return org.springframework.kafka.config.TopicBuilder
+        .name(properties.getKafka().getDltTopic())
+        .partitions(properties.getKafka().getRawTopicPartitions())
+        .replicas(properties.getKafka().getDltTopicReplicas())
+        .config("min.insync.replicas",
+            String.valueOf(properties.getKafka().getMinInsyncReplicas()))
+        .build();
   }
 
   @Bean

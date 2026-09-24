@@ -49,11 +49,21 @@ shore:
     username: ${MQTT_USERNAME:}
     password: ${MQTT_PASSWORD:}
     connect-retry-delay-ms: 5000
+    # Dedicated ACK worker bounds: 1 in-flight + this many queued; overflow drops
+    # fast and Edge resends (absorbed by UNIQUE(msg_id)).
+    ack-queue-capacity: ${MQTT_ACK_QUEUE_CAPACITY:200}
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     raw-topic: ship.telemetry.raw
     raw-topic-partitions: 6
     dlt-topic: ship.telemetry.raw.DLT
+    # Durable-ACK foundation: acks=all is only quorum-durable with real replicas.
+    # Local single-broker default stays 1/1; production must set
+    # KAFKA_RAW_TOPIC_REPLICAS=3, KAFKA_DLT_TOPIC_REPLICAS=3,
+    # KAFKA_MIN_INSYNC_REPLICAS=2. Incoherent triples fail fast at startup.
+    raw-topic-replicas: ${KAFKA_RAW_TOPIC_REPLICAS:1}
+    dlt-topic-replicas: ${KAFKA_DLT_TOPIC_REPLICAS:1}
+    min-insync-replicas: ${KAFKA_MIN_INSYNC_REPLICAS:1}
     # DLT producer bound: delivery.timeout.ms >= request.timeout.ms + linger.ms
     # (5000 >= 4000 + 0); violations fail fast at startup.
     dlt-request-timeout-ms: 4000
