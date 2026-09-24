@@ -15,7 +15,9 @@ import com.smartship.shore.observability.ShoreMetrics;
 import com.smartship.shore.persistence.TelemetryHistoryEntity;
 import com.smartship.shore.persistence.TelemetryHistoryRepository;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -27,6 +29,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabase;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseBuilder;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType;
+import org.springframework.kafka.listener.BatchListenerFailedException;
 import org.springframework.kafka.support.Acknowledgment;
 
 /**
@@ -131,7 +134,7 @@ class HistoryConsumerTest {
     String json = envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z");
     TestAck ack = new TestAck();
 
-    consumer.listen(record("413999999", json), ack);
+    consumer.listenBatch(List.of(record("413999999", json)), ack);
 
     assertTrue(ack.acknowledged, "offset must be acknowledged after DB success");
     assertEquals(1L, repository.countAll());
@@ -161,7 +164,7 @@ class HistoryConsumerTest {
     String json = envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z");
     TestAck ack = new TestAck();
 
-    consumer.listen(record("413999999", json), ack);
+    consumer.listenBatch(List.of(record("413999999", json)), ack);
 
     assertTrue(ack.acknowledged);
     JsonNode payload = storedPayload(
@@ -181,8 +184,8 @@ class HistoryConsumerTest {
     TestAck first = new TestAck();
     TestAck second = new TestAck();
 
-    consumer.listen(record("413999999", json), first);
-    consumer.listen(record("413999999", json), second);
+    consumer.listenBatch(List.of(record("413999999", json)), first);
+    consumer.listenBatch(List.of(record("413999999", json)), second);
 
     assertTrue(first.acknowledged);
     assertTrue(second.acknowledged, "duplicate must also ACK so the offset advances");
@@ -211,8 +214,7 @@ class HistoryConsumerTest {
 
     // Kafka redelivers after the restart: absorbed by UNIQUE(msg_id), offset advances.
     TestAck replayAck = new TestAck();
-    consumer.listen(
-        record("413999999", envelope("413999999", "nmea_depth", "5001", "2026-09-19T03:00:00Z")),
+    consumer.listenBatch(List.of(record("413999999", envelope("413999999", "nmea_depth", "5001", "2026-09-19T03:00:00Z"))),
         replayAck);
 
     assertTrue(replayAck.acknowledged);
@@ -227,10 +229,8 @@ class HistoryConsumerTest {
     TestAck ackA = new TestAck();
     TestAck ackB = new TestAck();
 
-    consumer.listen(
-        record("413999999", envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z")), ackA);
-    consumer.listen(
-        record("412888888", envelope("412888888", "nmea_wind", "2002", "2026-09-19T02:01:00Z")), ackB);
+    consumer.listenBatch(List.of(record("413999999", envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z"))), ackA);
+    consumer.listenBatch(List.of(record("412888888", envelope("412888888", "nmea_wind", "2002", "2026-09-19T02:01:00Z"))), ackB);
 
     assertTrue(ackA.acknowledged);
     assertTrue(ackB.acknowledged);
@@ -244,8 +244,13 @@ class HistoryConsumerTest {
   void poisonRecordGoesToDlt() {
     TestAck ack = new TestAck();
 
-    assertThrows(InvalidTelemetryException.class,
-        () -> consumer.listen(record("413999999", "{not-json-at-all"), ack));
+    // Batch entry point reports the exact batch index; the poison itself still
+    // travels as the cause so the error handler routes it straight to the DLT.
+    BatchListenerFailedException thrown = assertThrows(BatchListenerFailedException.class,
+        () -> consumer.listenBatch(
+            List.of(record("413999999", "{not-json-at-all")), ack));
+    assertEquals(0, thrown.getIndex());
+    assertTrue(thrown.getCause() instanceof InvalidTelemetryException);
 
     assertTrue(!ack.acknowledged, "poison must NOT acknowledge (DLT path owns the offset)");
     assertEquals(0L, repository.countAll());
@@ -260,8 +265,9 @@ class HistoryConsumerTest {
         + "\"timestamp\":\"2026-09-19T02:00:00Z\","
         + "\"sent_at\":\"2026-09-19T02:00:05Z\",\"data\":{\"speed_knots\":12.5}}";
 
-    assertThrows(InvalidTelemetryException.class,
-        () -> consumer.listen(record("413999999", json), ack));
+    BatchListenerFailedException thrown = assertThrows(BatchListenerFailedException.class,
+        () -> consumer.listenBatch(List.of(record("413999999", json)), ack));
+    assertTrue(thrown.getCause() instanceof InvalidTelemetryException);
 
     assertTrue(!ack.acknowledged);
     assertEquals(0L, repository.countAll());
@@ -272,13 +278,21 @@ class HistoryConsumerTest {
   @DisplayName("Transient DB failure: not acknowledged, exception propagates for redelivery")
   void transientFailureRedelivers() {
     TelemetryHistoryRepository failing = org.mockito.Mockito.mock(TelemetryHistoryRepository.class);
+    org.mockito.Mockito.when(failing.existingMsgIds(org.mockito.ArgumentMatchers.any()))
+        .thenReturn(Set.of());
+    org.mockito.Mockito.doThrow(new TransientDataAccessResourceException("lock wait timeout"))
+        .when(failing).insertBatch(org.mockito.ArgumentMatchers.anyList());
     org.mockito.Mockito.doThrow(new TransientDataAccessResourceException("lock wait timeout"))
         .when(failing).insert(org.mockito.ArgumentMatchers.any());
     HistoryConsumer failingConsumer = new HistoryConsumer(failing, objectMapper, metrics);
     TestAck ack = new TestAck();
 
-    assertThrows(RuntimeException.class, () -> failingConsumer.listen(
-        record("413999999", envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z")), ack));
+    // Batch insert fails, per-record fallback fails the same way: the exact batch
+    // index is reported so the handler retries precisely this record.
+    BatchListenerFailedException thrown = assertThrows(BatchListenerFailedException.class,
+        () -> failingConsumer.listenBatch(List.of(record("413999999", envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z"))), ack));
+    assertEquals(0, thrown.getIndex());
+    assertTrue(thrown.getCause() instanceof TransientDataAccessResourceException);
 
     assertTrue(!ack.acknowledged, "transient failure must NOT acknowledge");
     assertEquals(1.0, metrics.getHistoryFailedTotal().count());
@@ -290,14 +304,76 @@ class HistoryConsumerTest {
     TelemetryHistoryRepository failing = org.mockito.Mockito.mock(TelemetryHistoryRepository.class);
     // NOTE: Spring classifies this as non-transient, but the error handler still routes
     // every unknown DB error through bounded retry into the DLT — never a silent skip.
+    org.mockito.Mockito.when(failing.existingMsgIds(org.mockito.ArgumentMatchers.any()))
+        .thenReturn(Set.of());
+    org.mockito.Mockito.doThrow(new DataAccessResourceFailureException("connection reset"))
+        .when(failing).insertBatch(org.mockito.ArgumentMatchers.anyList());
     org.mockito.Mockito.doThrow(new DataAccessResourceFailureException("connection reset"))
         .when(failing).insert(org.mockito.ArgumentMatchers.any());
     HistoryConsumer failingConsumer = new HistoryConsumer(failing, objectMapper, metrics);
     TestAck ack = new TestAck();
 
-    assertThrows(RuntimeException.class, () -> failingConsumer.listen(
-        record("413999999", envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z")), ack));
+    assertThrows(BatchListenerFailedException.class, () -> failingConsumer.listenBatch(List.of(record("413999999", envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z"))), ack));
 
     assertTrue(!ack.acknowledged, "connection failure must NOT acknowledge");
+  }
+
+  @Test
+  @DisplayName("Batch: three distinct records persist with a single ACK")
+  void batchOfDistinctRecordsPersistsWithOneAck() {
+    TestAck ack = new TestAck();
+
+    consumer.listenBatch(List.of(
+        record("413999999", envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z")),
+        record("412888888", envelope("412888888", "nmea_wind", "2002", "2026-09-19T02:01:00Z")),
+        record("413999999", envelope("413999999", "nmea_depth", "5001", "2026-09-19T03:00:00Z"))),
+        ack);
+
+    assertTrue(ack.acknowledged, "one ACK covers the whole landed batch");
+    assertEquals(3L, repository.countAll());
+    assertEquals(3.0, metrics.getHistoryConsumedTotal().count());
+    assertEquals(3.0, metrics.getHistoryPersistedTotal().count());
+    assertEquals(0.0, metrics.getHistoryDuplicateTotal().count());
+  }
+
+  @Test
+  @DisplayName("Batch: intra-batch duplicate converges to one row with ACK")
+  void batchIntraBatchDuplicateConverges() {
+    String json = envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z");
+    TestAck ack = new TestAck();
+
+    // Same msg_id twice inside one poll batch: exactly one row survives, whatever
+    // path (batch or fallback) the driver takes — offset still advances.
+    consumer.listenBatch(
+        List.of(record("413999999", json), record("413999999", json)), ack);
+
+    assertTrue(ack.acknowledged);
+    assertEquals(1L, repository.countAll(), "at-least-once + msg_id keeps exactly one row");
+    // Attribution (persisted-vs-duplicate) is driver- and transaction-dependent: in
+    // production insertBatch is @Transactional so the failed batch rolls back fully
+    // and the fallback counts exactly one persist + one duplicate; this plain-unit
+    // context has no tx proxy, so a partially-landed batch may count both repeats
+    // as duplicates. The invariants are one row and forward progress, never a row more.
+    assertTrue(metrics.getHistoryDuplicateTotal().count() >= 1.0);
+  }
+
+  @Test
+  @DisplayName("Batch: poison aborts the batch for DLT routing, nothing stored, no ACK")
+  void batchPoisonAbortsBatch() {
+    TestAck ack = new TestAck();
+
+    BatchListenerFailedException thrown = assertThrows(BatchListenerFailedException.class,
+        () -> consumer.listenBatch(List.of(
+            record("413999999",
+                envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z")),
+            record("413999999", "{not-json-at-all")),
+            ack));
+    assertEquals(1, thrown.getIndex());
+    assertTrue(thrown.getCause() instanceof InvalidTelemetryException);
+
+    // The valid record ahead of the poison is NOT persisted ahead of the outcome:
+    // it is redelivered by the next poll after the poison is DLT-recovered.
+    assertTrue(!ack.acknowledged);
+    assertEquals(0L, repository.countAll());
   }
 }

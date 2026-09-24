@@ -213,7 +213,10 @@ public class KafkaConfig {
         (record, ex) -> {
           // historyDlt increments only after accept() returns: a failed or timed-out
           // DLT send throws first, so "attempted DLT" is never counted as "in DLT".
-          recoverer.accept(record, ex);
+          // The batch listener reports failures wrapped with their batch index (used
+          // for seeking); the wrapper is stripped here so the DLT record carries the
+          // root failure with byte-identical headers to the single-record era.
+          recoverer.accept(record, unwrapBatchFailure(ex));
           metrics.historyDlt(ShoreMetrics.classify(ex));
         },
         new FixedBackOff(HISTORY_RETRY_INTERVAL_MS, HISTORY_MAX_RETRIES));
@@ -240,6 +243,22 @@ public class KafkaConfig {
   }
 
   /**
+   * Strips batch-reporting wrappers ({@code BatchListenerFailedException}) down to the
+   * root failure. Spring's own header builder only looks through
+   * {@code ListenerExecutionFailedException}, so without this the DLT headers would
+   * name the reporting wrapper instead of the real failure. Classification and metrics
+   * walk the whole cause chain and are unaffected either way.
+   */
+  private static Exception unwrapBatchFailure(Exception ex) {
+    Exception current = ex;
+    while (current instanceof org.springframework.kafka.listener.BatchListenerFailedException
+        && current.getCause() instanceof Exception cause) {
+      current = cause;
+    }
+    return current;
+  }
+
+  /**
    * Manual-confirm container: offsets commit only via the {@code Acknowledgment} passed to
    * {@code HistoryConsumer} (or via the error handler after a recovered DLT publish).
    * Failures never commit early; {@code concurrency=1} preserves per-partition order into MySQL.
@@ -251,6 +270,31 @@ public class KafkaConfig {
     ConcurrentKafkaListenerContainerFactory<String, String> factory =
         new ConcurrentKafkaListenerContainerFactory<>();
     factory.setConsumerFactory(shoreConsumerFactory);
+    factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+    // One thread: preserves per-partition order into MySQL.
+    factory.setConcurrency(1);
+    factory.setCommonErrorHandler(shoreHistoryErrorHandler);
+    return factory;
+  }
+
+  /**
+   * Batch twin of the history container: same consumer factory, same manual-confirm
+   * semantics, same shared error handler — only the poll batch lands in one listener
+   * call so one JDBC batch and one offset commit serve up to
+   * {@code max.poll.records} messages. {@code DefaultErrorHandler} natively serves
+   * both modes; per-record failures inside a batch are reported back with their
+   * batch index ({@code BatchListenerFailedException}) so retry/DLT stay
+   * record-precise. LatestState keeps the single-record factory untouched.
+   */
+  @Bean
+  public ConcurrentKafkaListenerContainerFactory<String, String>
+      shoreBatchKafkaListenerContainerFactory(
+          ConsumerFactory<String, String> shoreConsumerFactory,
+          CommonErrorHandler shoreHistoryErrorHandler) {
+    ConcurrentKafkaListenerContainerFactory<String, String> factory =
+        new ConcurrentKafkaListenerContainerFactory<>();
+    factory.setConsumerFactory(shoreConsumerFactory);
+    factory.setBatchListener(true);
     factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
     // One thread: preserves per-partition order into MySQL.
     factory.setConcurrency(1);

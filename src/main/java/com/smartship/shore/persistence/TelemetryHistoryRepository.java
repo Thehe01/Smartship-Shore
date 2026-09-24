@@ -3,8 +3,14 @@ package com.smartship.shore.persistence;
 import java.sql.ResultSet;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
@@ -80,6 +86,77 @@ public class TelemetryHistoryRepository {
         jdbcTemplate.queryForObject(
             "SELECT COUNT(*) FROM ship_telemetry_history WHERE msg_id = ?", Long.class, msgId);
     return n != null && n > 0;
+  }
+
+  /**
+   * Batch variant of {@link #insert}: one JDBC round trip for the whole list.
+   * Generated ids are not filled (callers needing one id use {@link #insert}).
+   *
+   * <p>Runs in one transaction so a batch failure leaves nothing behind: the caller
+   * falls back to per-record inserts from a clean slate, with exact persisted /
+   * duplicate accounting. Without atomicity a partially-landed batch would still
+   * converge (duplicates absorbed) but the metric attribution would blur.
+   *
+   * @throws org.springframework.dao.DataAccessException on any batch failure
+   */
+  @org.springframework.transaction.annotation.Transactional
+  public void insertBatch(List<TelemetryHistoryEntity> entities) {
+    if (entities == null || entities.isEmpty()) {
+      return;
+    }
+    jdbcTemplate.batchUpdate(INSERT_SQL, new BatchPreparedStatementSetter() {
+      @Override
+      public void setValues(java.sql.PreparedStatement ps, int i)
+          throws java.sql.SQLException {
+        TelemetryHistoryEntity entity = entities.get(i);
+        ps.setString(1, entity.getMsgId());
+        ps.setString(2, entity.getMmsi());
+        ps.setString(3, entity.getType());
+        setInstant(ps, 4, entity.getEventTime());
+        setInstant(ps, 5, entity.getSentAt());
+        setInstant(ps, 6, entity.getReceivedAt());
+        ps.setString(7, entity.getPayloadJson());
+        if (entity.getKafkaPartition() == null) {
+          ps.setNull(8, java.sql.Types.INTEGER);
+        } else {
+          ps.setInt(8, entity.getKafkaPartition());
+        }
+        if (entity.getKafkaOffset() == null) {
+          ps.setNull(9, java.sql.Types.BIGINT);
+        } else {
+          ps.setLong(9, entity.getKafkaOffset());
+        }
+      }
+
+      @Override
+      public int getBatchSize() {
+        return entities.size();
+      }
+    });
+  }
+
+  /**
+   * Returns the subset of {@code msgIds} already stored. Used as a batch
+   * dedup pre-check so redeliveries never reach the insert path; the unique
+   * constraint — not this pre-check — remains the correctness mechanism.
+   */
+  public Set<String> existingMsgIds(Collection<String> msgIds) {
+    List<String> ids = new ArrayList<>(new HashSet<>(msgIds));
+    if (ids.isEmpty()) {
+      return Set.of();
+    }
+    StringBuilder sql = new StringBuilder(
+        "SELECT msg_id FROM ship_telemetry_history WHERE msg_id IN (");
+    for (int i = 0; i < ids.size(); i++) {
+      if (i > 0) {
+        sql.append(',');
+      }
+      sql.append('?');
+    }
+    sql.append(')');
+    List<String> found =
+        jdbcTemplate.queryForList(sql.toString(), String.class, ids.toArray());
+    return new HashSet<>(found);
   }
 
   public Optional<TelemetryHistoryEntity> findByMsgId(String msgId) {

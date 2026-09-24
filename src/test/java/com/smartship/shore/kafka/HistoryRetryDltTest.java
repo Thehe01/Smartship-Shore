@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
@@ -25,6 +26,8 @@ import com.smartship.shore.persistence.TelemetryHistoryEntity;
 import com.smartship.shore.persistence.TelemetryHistoryRepository;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Instant;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -158,7 +161,7 @@ class HistoryRetryDltTest {
   /** One container delivery: listener first, production error handler on failure. */
   private void deliver(HistoryConsumer target, ConsumerRecord<String, String> rec, TestAck ack) {
     try {
-      target.listen(rec, ack);
+      target.listenBatch(List.of(rec), ack);
     } catch (Exception e) {
       handler.handleOne(e, rec, kafkaConsumer, container);
     }
@@ -219,6 +222,12 @@ class HistoryRetryDltTest {
         .doThrow(new TransientDataAccessResourceException("lock timeout"))
         .doCallRealMethod()
         .when(flaky).insert(any(TelemetryHistoryEntity.class));
+    // The batch fast path runs first: same fail-fail-success script so the
+    // fallback converges through the identical single-record policy.
+    doThrow(new TransientDataAccessResourceException("lock timeout"))
+        .doThrow(new TransientDataAccessResourceException("lock timeout"))
+        .doCallRealMethod()
+        .when(flaky).insertBatch(anyList());
     HistoryConsumer flakyConsumer = new HistoryConsumer(flaky, objectMapper, metrics);
     ConsumerRecord<String, String> rec = record("413999999",
         envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z"));
@@ -226,7 +235,7 @@ class HistoryRetryDltTest {
     for (int i = 0; i < 3; i++) {
       TestAck ack = new TestAck();
       try {
-        flakyConsumer.listen(rec, ack);
+        flakyConsumer.listenBatch(List.of(rec), ack);
         assertTrue(ack.acknowledged, "third attempt must ACK");
         break;
       } catch (Exception e) {
@@ -247,6 +256,10 @@ class HistoryRetryDltTest {
     TelemetryHistoryRepository failing = mock(TelemetryHistoryRepository.class);
     doThrow(new TransientDataAccessResourceException("connection reset"))
         .when(failing).insert(any(TelemetryHistoryEntity.class));
+    // Batch fast path fails the same way (fallback then reports the exact record).
+    doThrow(new TransientDataAccessResourceException("connection reset"))
+        .when(failing).insertBatch(anyList());
+    doReturn(Set.of()).when(failing).existingMsgIds(any());
     HistoryConsumer failingConsumer = new HistoryConsumer(failing, objectMapper, metrics);
     String json = envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z");
     ConsumerRecord<String, String> rec = record("413999999", json);
@@ -254,7 +267,7 @@ class HistoryRetryDltTest {
     // Attempts 1–3: still retrying, nothing in the DLT yet (bounded, not infinite).
     for (int i = 0; i < 3; i++) {
       try {
-        failingConsumer.listen(rec, new TestAck());
+        failingConsumer.listenBatch(List.of(rec), new TestAck());
       } catch (Exception e) {
         handler.handleOne(e, rec, kafkaConsumer, container);
       }
@@ -264,7 +277,7 @@ class HistoryRetryDltTest {
     // Attempt 4: budget spent → exactly one DLT record, recovery reported complete.
     boolean recovered = false;
     try {
-      failingConsumer.listen(rec, new TestAck());
+      failingConsumer.listenBatch(List.of(rec), new TestAck());
     } catch (Exception e) {
       recovered = handler.handleOne(e, rec, kafkaConsumer, container);
     }
@@ -278,6 +291,8 @@ class HistoryRetryDltTest {
     assertEquals(RAW, header(dlt, KafkaHeaders.DLT_ORIGINAL_TOPIC));
     assertNotNull(dlt.headers().lastHeader(KafkaHeaders.DLT_ORIGINAL_PARTITION));
     assertNotNull(dlt.headers().lastHeader(KafkaHeaders.DLT_ORIGINAL_OFFSET));
+    // The handler unwraps the batch-reporting wrapper before publishing, so the DLT
+    // headers name the root failure exactly as in the single-record era.
     assertTrue(header(dlt, KafkaHeaders.DLT_EXCEPTION_FQCN)
         .contains("TransientDataAccessResourceException"));
     assertTrue(header(dlt, KafkaHeaders.DLT_EXCEPTION_MESSAGE).contains("connection reset"));
@@ -295,7 +310,7 @@ class HistoryRetryDltTest {
     // A single handler pass is enough: no backoff sleeps, straight to recovery.
     long started = System.nanoTime();
     try {
-      consumer.listen(rec, new TestAck());
+      consumer.listenBatch(List.of(rec), new TestAck());
     } catch (Exception e) {
       handler.handleOne(e, rec, kafkaConsumer, container);
     }
@@ -325,7 +340,7 @@ class HistoryRetryDltTest {
     ConsumerRecord<String, String> rec = record("413999999", json);
 
     try {
-      consumer.listen(rec, new TestAck());
+      consumer.listenBatch(List.of(rec), new TestAck());
     } catch (Exception e) {
       handler.handleOne(e, rec, kafkaConsumer, container);
     }
@@ -350,6 +365,9 @@ class HistoryRetryDltTest {
     TelemetryHistoryRepository failing = mock(TelemetryHistoryRepository.class);
     doThrow(new TransientDataAccessResourceException("connection reset"))
         .when(failing).insert(any(TelemetryHistoryEntity.class));
+    doThrow(new TransientDataAccessResourceException("connection reset"))
+        .when(failing).insertBatch(anyList());
+    doReturn(Set.of()).when(failing).existingMsgIds(any());
     HistoryConsumer failingConsumer = new HistoryConsumer(failing, objectMapper, metrics);
     String json = envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z");
     ConsumerRecord<String, String> rec = record("413999999", json);
@@ -357,7 +375,7 @@ class HistoryRetryDltTest {
     // Attempts 1–3: bounded retries, no DLT attempt succeeding.
     for (int i = 0; i < 3; i++) {
       try {
-        failingConsumer.listen(rec, new TestAck());
+        failingConsumer.listenBatch(List.of(rec), new TestAck());
       } catch (Exception e) {
         handler.handleOne(e, rec, kafkaConsumer, container);
       }
@@ -366,7 +384,7 @@ class HistoryRetryDltTest {
     // Attempt 4: recovery runs, the DLT send fails → not recovered (false, not silent true).
     boolean recovered = true;
     try {
-      failingConsumer.listen(rec, new TestAck());
+      failingConsumer.listenBatch(List.of(rec), new TestAck());
     } catch (Exception e) {
       recovered = handler.handleOne(e, rec, kafkaConsumer, container);
     }
@@ -387,7 +405,7 @@ class HistoryRetryDltTest {
     recovered = false;
     for (int i = 0; i < 10 && !recovered; i++) {
       try {
-        failingConsumer.listen(rec, new TestAck());
+        failingConsumer.listenBatch(List.of(rec), new TestAck());
       } catch (Exception e) {
         recovered = handler.handleOne(e, rec, kafkaConsumer, container);
       }
@@ -407,13 +425,16 @@ class HistoryRetryDltTest {
     TelemetryHistoryRepository failing = mock(TelemetryHistoryRepository.class);
     doThrow(new TransientDataAccessResourceException("connection reset"))
         .when(failing).insert(any(TelemetryHistoryEntity.class));
+    doThrow(new TransientDataAccessResourceException("connection reset"))
+        .when(failing).insertBatch(anyList());
+    doReturn(Set.of()).when(failing).existingMsgIds(any());
     HistoryConsumer failingConsumer = new HistoryConsumer(failing, objectMapper, metrics);
     ConsumerRecord<String, String> rec = record("413999999",
         envelope("413999999", "nmea_gps", "1001", "2026-09-19T02:00:00Z"));
 
     for (int i = 0; i < 3; i++) {
       try {
-        failingConsumer.listen(rec, new TestAck());
+        failingConsumer.listenBatch(List.of(rec), new TestAck());
       } catch (Exception e) {
         handler.handleOne(e, rec, kafkaConsumer, container);
       }
@@ -422,7 +443,7 @@ class HistoryRetryDltTest {
     long started = System.nanoTime();
     boolean recovered = true;
     try {
-      failingConsumer.listen(rec, new TestAck());
+      failingConsumer.listenBatch(List.of(rec), new TestAck());
     } catch (Exception e) {
       recovered = handler.handleOne(e, rec, kafkaConsumer, container);
     }
