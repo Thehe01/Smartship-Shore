@@ -24,6 +24,20 @@ jobs:
       # GitHub-hosted runners ship Docker, so every Testcontainers E2E
       # (Mosquitto / Kafka / MySQL / Redis) runs for real here: nothing
       # may be skipped or disabled to get green.
+      #
+      # Cross-repo E2E (EdgeProtocolE2ETest) compiles against the real Edge
+      # classes via a test-scope dependency. The Edge repo is public, so the
+      # stock token can check it out; install once into the job-local ~/.m2
+      # (reused by the retry loop below through the maven cache).
+      - name: Checkout Edge repo
+        uses: actions/checkout@v4
+        with:
+          repository: Thehe01/Smartship
+          ref: main
+          path: .edge-checkout
+
+      - name: Install Edge artifact (test-scope E2E dependency)
+        run: mvn -B -f .edge-checkout/pom.xml install -DskipTests
       # A cold runner cache can hit Maven Central rate limits (HTTP 429) while
       # resolving artifacts. That is transient infra noise, so each Maven
       # invocation retries up to 3 times with growing backoff; every retry
@@ -65,7 +79,8 @@ jobs:
           echo "=== Docker E2E must have really executed (Skipped must be 0) ==="
           for t in HistoryConsumerTestcontainersTest TrueE2EMqttKafkaMySqlTest \
                    MqttRedeliveryE2ETest HistoryDltTestcontainersTest \
-                   LatestStateLuaTestcontainersTest LatestStateKafkaTestcontainersTest; do
+                   LatestStateLuaTestcontainersTest LatestStateKafkaTestcontainersTest \
+                   EdgeProtocolE2ETest; do
             f=$(ls target/surefire-reports/*"$t".txt 2>/dev/null || true)
             if [ -z "$f" ]; then
               echo "FAIL: no surefire report for $t"

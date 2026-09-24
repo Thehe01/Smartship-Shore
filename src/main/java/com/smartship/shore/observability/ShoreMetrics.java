@@ -30,6 +30,7 @@ public class ShoreMetrics {
   private final Counter kafkaProduceFailedTotal;
   private final Counter kafkaAckPublishedTotal;
   private final Counter kafkaAckFailedTotal;
+  private final Counter ackClientRebuildTotal;
 
   private final Counter historyConsumedTotal;
   private final Counter historyPersistedTotal;
@@ -72,6 +73,11 @@ public class ShoreMetrics {
         Counter.builder("smartship_shore_kafka_ack_failed_total")
             .description("Application ACK publishes that failed or timed out (Edge resends;"
                 + " the Kafka record itself is already durable)")
+            .register(registry);
+    this.ackClientRebuildTotal =
+        Counter.builder("smartship_shore_ack_client_rebuild_total")
+            .description("ACK client rebuilds after consecutive PUBACK timeouts"
+                + " (wedged-connection self-heal)")
             .register(registry);
     this.historyConsumedTotal =
         Counter.builder("smartship_shore_history_consumed_total")
@@ -130,6 +136,10 @@ public class ShoreMetrics {
 
   public void kafkaAckFailed() {
     kafkaAckFailedTotal.increment();
+  }
+
+  public void recordAckClientRebuild() {
+    ackClientRebuildTotal.increment();
   }
 
   public void historyConsumed() {

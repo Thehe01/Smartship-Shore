@@ -52,6 +52,8 @@ shore:
     # Dedicated ACK worker bounds: 1 in-flight + this many queued; overflow drops
     # fast and Edge resends (absorbed by UNIQUE(msg_id)).
     ack-queue-capacity: ${MQTT_ACK_QUEUE_CAPACITY:200}
+    # Consecutive PUBACK timeouts before the wedged ACK client is rebuilt.
+    ack-client-rebuild-threshold: ${MQTT_ACK_REBUILD_THRESHOLD:3}
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     raw-topic: ship.telemetry.raw

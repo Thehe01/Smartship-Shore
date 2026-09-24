@@ -15,8 +15,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.IMqttAsyncClient;
+import org.eclipse.paho.client.mqttv3.IMqttToken;
+import org.eclipse.paho.client.mqttv3.MqttAsyncClient;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
 import org.springframework.stereotype.Component;
@@ -40,6 +43,14 @@ import org.springframework.util.StringUtils;
  *
  * <p>Uses its own Paho client (never the subscriber's): publishing from inside the
  * subscriber callback would tangle manual ACKs with outbound inflight.
+ *
+ * <p>Liveness: the blocking {@code MqttClient.publish} is deliberately NOT used.
+ * {@code MqttAsyncClient.publish} returns immediately and
+ * {@code IMqttToken.waitForCompletion(timeout)} bounds the wait inside Paho itself,
+ * so the single worker can never wedge forever on one slow broker. After
+ * {@code ackClientRebuildThreshold} consecutive PUBACK timeouts the client is
+ * dropped and rebuilt on the next call (a late duplicate ACK stays harmless:
+ * Edge matches on {@code msg_id}).
  */
 @Slf4j
 @Component
@@ -53,7 +64,9 @@ public class MqttAckPublisher {
   private final ObjectMapper objectMapper;
   private final ShoreMetrics metrics;
 
-  private volatile MqttClient client;
+  private volatile IMqttAsyncClient client;
+  private final java.util.concurrent.atomic.AtomicInteger consecutiveTimeouts =
+      new java.util.concurrent.atomic.AtomicInteger(0);
 
   /**
    * Dedicated bounded ACK publisher: a single worker so outbound publishes never
@@ -77,7 +90,7 @@ public class MqttAckPublisher {
       return false;
     }
     try {
-      MqttClient c = ensureConnected(mqtt);
+      IMqttAsyncClient c = ensureConnected(mqtt);
       if (c == null) {
         metrics.kafkaAckFailed();
         return false;
@@ -91,22 +104,15 @@ public class MqttAckPublisher {
       byte[] payload = objectMapper.writeValueAsBytes(ack);
       MqttMessage message = new MqttMessage(payload);
       message.setQos(1);
-      // MqttClient.publish is blocking with no timeout of its own: time-box it on
-      // the dedicated bounded executor so one slow broker cannot stall the serial
-      // ingest callback NOR pile up unbounded common-pool threads. A timed-out call
-      // may still land late as a duplicate ACK — harmless by design (Edge matches
-      // on msg_id and resends are idempotent downstream). A full queue rejects fast
-      // instead of queueing forever: same harmless duplicate cost.
+      // Async publish + token timeout on the dedicated bounded worker: the wait is
+      // bounded inside Paho itself (no permanent wedge), the caller wait only frees
+      // the serial ingest callback, and a full queue rejects fast. A timed-out or
+      // late duplicate ACK is harmless by design (Edge matches on msg_id, resends
+      // are idempotent downstream).
       String topic = "ship/" + mmsi + "/ack";
-      final Future<?> future;
+      final Future<Boolean> future;
       try {
-        future = ackExecutor(mqtt).submit(() -> {
-          try {
-            c.publish(topic, message);
-          } catch (Exception e) {
-            throw new RuntimeException(e);
-          }
-        });
+        future = ackExecutor(mqtt).submit(() -> publishAndWait(c, topic, message, mmsi, msgId));
       } catch (RejectedExecutionException rejected) {
         metrics.kafkaAckFailed();
         log.warn("[Shore-ACK] queue full, dropping ACK fast (Edge will resend): mmsi={} msg_id={}",
@@ -114,22 +120,25 @@ public class MqttAckPublisher {
         return false;
       }
       try {
-        future.get(mqtt.getAckTimeoutMs(), TimeUnit.MILLISECONDS);
+        return future.get(mqtt.getAckTimeoutMs() + 1000L, TimeUnit.MILLISECONDS);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         future.cancel(true);
         throw e;
       } catch (java.util.concurrent.TimeoutException e) {
-        // Do NOT cancel the underlying publish: Paho has no safe interrupt, and a
-        // late duplicate ACK is harmless. The single worker serializes the damage;
-        // the timeout only frees the ingest callback thread.
+        // Practically unreachable: the worker bounds itself via waitForCompletion.
+        // Kept as a second fence so the ingest callback can never park forever.
         metrics.kafkaAckFailed();
-        log.warn("[Shore-ACK] publish timed out, worker continues in background "
-            + "(Edge will resend): mmsi={} msg_id={}", mmsi, msgId);
+        log.warn("[Shore-ACK] worker overran its own timeout (Edge will resend): mmsi={} msg_id={}",
+            mmsi, msgId);
+        return false;
+      } catch (java.util.concurrent.ExecutionException e) {
+        // publishAndWait never throws (all paths return boolean), defensive only.
+        metrics.kafkaAckFailed();
+        log.warn("[Shore-ACK] worker failed (Edge will resend): mmsi={} msg_id={} err={}",
+            mmsi, msgId, e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
         return false;
       }
-      metrics.kafkaAckPublished();
-      return true;
     } catch (Exception e) {
       metrics.kafkaAckFailed();
       log.warn("[Shore-ACK] publish failed (Edge will resend): mmsi={} msg_id={} err={}",
@@ -137,6 +146,52 @@ public class MqttAckPublisher {
       dropClient();
       return false;
     }
+  }
+
+  /**
+   * One async publish fenced by the token timeout. Never throws: every outcome maps
+   * to a boolean, consecutive PUBACK timeouts trigger a client rebuild so a wedged
+   * connection heals itself instead of stalling the worker forever.
+   */
+  private boolean publishAndWait(IMqttAsyncClient c, String topic, MqttMessage message,
+      String mmsi, String msgId) {
+    ShoreProperties.Mqtt mqtt = properties.getMqtt();
+    final IMqttToken token;
+    try {
+      token = c.publish(topic, message);
+    } catch (Exception e) {
+      metrics.kafkaAckFailed();
+      log.warn("[Shore-ACK] async submit failed (Edge will resend): mmsi={} msg_id={} err={}",
+          mmsi, msgId, e.getMessage());
+      dropClient();
+      return false;
+    }
+    try {
+      token.waitForCompletion(mqtt.getAckTimeoutMs());
+    } catch (MqttException e) {
+      metrics.kafkaAckFailed();
+      if (e.getReasonCode() == MqttException.REASON_CODE_CLIENT_TIMEOUT) {
+        int n = consecutiveTimeouts.incrementAndGet();
+        log.warn("[Shore-ACK] PUBACK timeout {}/{} (Edge will resend): mmsi={} msg_id={}",
+            n, Math.max(1, mqtt.getAckClientRebuildThreshold()), mmsi, msgId);
+        if (n >= Math.max(1, mqtt.getAckClientRebuildThreshold())) {
+          consecutiveTimeouts.set(0);
+          metrics.recordAckClientRebuild();
+          dropClient();
+          log.warn("[Shore-ACK] rebuilding wedged ACK client after {} consecutive timeouts",
+              mqtt.getAckClientRebuildThreshold());
+        }
+      } else {
+        consecutiveTimeouts.set(0);
+        log.warn("[Shore-ACK] publish failed (Edge will resend): mmsi={} msg_id={} err={}",
+            mmsi, msgId, e.getMessage());
+        dropClient();
+      }
+      return false;
+    }
+    consecutiveTimeouts.set(0);
+    metrics.kafkaAckPublished();
+    return true;
   }
 
   /** Lazily builds the single-worker bounded ACK executor. */
@@ -175,7 +230,7 @@ public class MqttAckPublisher {
   }
 
   /** Test hook: injects the client used for publishing. */
-  void setClientForTests(MqttClient client) {
+  void setClientForTests(IMqttAsyncClient client) {
     this.client = client;
   }
 
@@ -188,15 +243,15 @@ public class MqttAckPublisher {
     return -1;
   }
 
-  private synchronized MqttClient ensureConnected(ShoreProperties.Mqtt mqtt) {
-    MqttClient c = client;
+  private synchronized IMqttAsyncClient ensureConnected(ShoreProperties.Mqtt mqtt) {
+    IMqttAsyncClient c = client;
     if (c != null && c.isConnected()) {
       return c;
     }
     dropClient();
     try {
-      MqttClient fresh =
-          new MqttClient(mqtt.getBrokerUrl(), mqtt.getClientId() + "-ack", new MemoryPersistence());
+      MqttAsyncClient fresh =
+          new MqttAsyncClient(mqtt.getBrokerUrl(), mqtt.getClientId() + "-ack", new MemoryPersistence());
       MqttConnectOptions options = new MqttConnectOptions();
       options.setAutomaticReconnect(true);
       options.setCleanSession(true);
@@ -206,7 +261,8 @@ public class MqttAckPublisher {
         options.setUserName(mqtt.getUsername());
         options.setPassword(mqtt.getPassword() == null ? new char[0] : mqtt.getPassword().toCharArray());
       }
-      fresh.connect(options);
+      fresh.connect(options)
+          .waitForCompletion(TimeUnit.SECONDS.toMillis(Math.max(1, mqtt.getConnectionTimeout())));
       client = fresh;
       log.info("[Shore-ACK] connected: broker={}", mqtt.getBrokerUrl());
       return fresh;
@@ -217,7 +273,7 @@ public class MqttAckPublisher {
   }
 
   private synchronized void dropClient() {
-    MqttClient c = client;
+    IMqttAsyncClient c = client;
     client = null;
     if (c != null) {
       try {

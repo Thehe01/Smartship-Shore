@@ -80,6 +80,14 @@ public class ShoreProperties {
      * unbounded {@code CompletableFuture.runAsync} pool would accumulate.
      */
     private int ackQueueCapacity = 200;
+    /**
+     * Consecutive PUBACK timeouts that trigger an ACK client rebuild
+     * ({@code shore.mqtt.ack-client-rebuild-threshold}, default 3). Bounds the
+     * damage of a wedged connection: after this many timeouts the client is
+     * dropped and rebuilt instead of stalling the worker at one ACK per timeout
+     * forever.
+     */
+    private int ackClientRebuildThreshold = 3;
   }
 
   @Data
