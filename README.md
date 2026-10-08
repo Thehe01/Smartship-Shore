@@ -243,3 +243,11 @@ Redis 每键最终态正确。同样只是单机 Docker 基线，不是生产容
 - 消费并发：`concurrency=1` 保序但吞吐上限即单线程写库能力；放开并发需重做顺序保证。
 - 精细退避：Kafka 长时间不可用时每条消息触发一次断线重连，当前是简单可解释策略。
 - DLT 回放工具：当前 DLT 只存现场，无一键回放链路。
+
+## MyBatis 历史归档
+
+技术栈：Java 17、Spring Boot 3.3.5、MyBatis（Spring Boot Starter 3.0.3）、MySQL、HikariCP、Flyway、Kafka、MQTT、Redis。
+
+`TelemetryHistoryMapper` 和同路径 XML 定义历史记录插入、批量插入、去重查询及统计。单行插入回填生成 ID，Instant 和可空字段由 MyBatis TypeHandler 映射。`TelemetryHistoryRepository` 使用 Spring `TransactionTemplate` 保证批量写入原子性，批量失败完成回滚后才由消费者逐条补写。`UNIQUE(msg_id)`、提交 Kafka offset 的时机、重试/DLT 和 Redis Lua CAS 语义保持不变。
+
+Flyway 继续负责表结构迁移。测试的建库/断言保留 JDBC，历史归档和跨仓 Edge 上传均通过真实 MyBatis Mapper。两仓同名 PR 分支存在时，CI 自动安装配套 Edge 分支；否则安装 Edge `main`。
