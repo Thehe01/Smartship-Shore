@@ -116,6 +116,7 @@ class EdgeProtocolE2ETest {
   /** Real Edge stack (plain constructors, no Spring): H2 → poller → MQTT. */
   static final class RealEdge implements AutoCloseable {
     final JdbcTemplate edgeJt;
+    final com.smartship.edge.persistence.EdgeTelemetryRepository edgeRepository;
     final MqttClientManager manager;
     final DatabaseUploadPoller poller;
     final UploadAckTracker tracker;
@@ -158,7 +159,21 @@ class EdgeProtocolE2ETest {
       manager = new MqttClientManager(props, edgeMetrics);
       MqttPublisher publisher = new MqttPublisher(manager);
       tracker = new UploadAckTracker();
-      poller = new DatabaseUploadPoller(props, edgeJt, publisher, null, null, tracker);
+      try {
+        var factoryBean = new org.mybatis.spring.SqlSessionFactoryBean();
+        factoryBean.setDataSource(ds);
+        var configuration = new org.apache.ibatis.session.Configuration();
+        configuration.setCallSettersOnNulls(true);
+        configuration.addMapper(com.smartship.edge.persistence.EdgeTelemetryMapper.class);
+        factoryBean.setConfiguration(configuration);
+        var session = new org.mybatis.spring.SqlSessionTemplate(factoryBean.getObject());
+        edgeRepository = new com.smartship.edge.persistence.EdgeTelemetryRepository(
+            session.getMapper(com.smartship.edge.persistence.EdgeTelemetryMapper.class),
+            new org.springframework.jdbc.datasource.DataSourceTransactionManager(ds));
+      } catch (Exception e) {
+        throw new IllegalStateException("Cannot create Edge MyBatis fixture", e);
+      }
+      poller = new DatabaseUploadPoller(props, edgeRepository, publisher, null, null, tracker);
       ship = new DatabaseUploadPoller.LocalShip(SHIP_ID, MMSI);
       stream = new DatabaseUploadPoller.IncrementalStream("gps", TABLE, "nmea_gps", "nmea_gps");
     }
@@ -193,7 +208,7 @@ class EdgeProtocolE2ETest {
       // Round 1: real Edge poller publishes; broker may still settle → retry.
       MqttTestSupport.waitUntil("edge published (in-flight tracked)", Duration.ofSeconds(60),
           () -> {
-            edge.poller.uploadIncrementalStream(edge.edgeJt, edge.ship, edge.stream);
+            edge.poller.uploadIncrementalStream(edge.edgeRepository, edge.ship, edge.stream);
             return edge.tracker.inFlightCount(MMSI, TABLE) > 0;
           });
 
@@ -202,7 +217,7 @@ class EdgeProtocolE2ETest {
           () -> edge.tracker.watermark(MMSI, TABLE, 0) == 1001L);
 
       // Round 2: watermark persists into the Edge cursor table.
-      edge.poller.uploadIncrementalStream(edge.edgeJt, edge.ship, edge.stream);
+      edge.poller.uploadIncrementalStream(edge.edgeRepository, edge.ship, edge.stream);
       assertEquals(1001L, edge.cursor(), "Edge cursor must advance on real KAFKA_COMMITTED ACK");
 
       // Shore side: exactly one history row with the contract-v1 msg_id.

@@ -29,11 +29,23 @@ jobs:
       # classes via a test-scope dependency. The Edge repo is public, so the
       # stock token can check it out; install once into the job-local ~/.m2
       # (reused by the retry loop below through the maven cache).
+      - name: Resolve paired Edge branch
+        id: counterpart
+        env:
+          CANDIDATE_REF: ${{ github.head_ref }}
+        run: |
+          counterpart_ref=main
+          if [ -n "$CANDIDATE_REF" ] && git ls-remote --exit-code --heads \
+              https://github.com/Thehe01/Smartship.git "refs/heads/$CANDIDATE_REF" >/dev/null 2>&1; then
+            counterpart_ref="$CANDIDATE_REF"
+          fi
+          echo "ref=$counterpart_ref" >> "$GITHUB_OUTPUT"
+
       - name: Checkout Edge repo
         uses: actions/checkout@v4
         with:
           repository: Thehe01/Smartship
-          ref: main
+          ref: ${{ steps.counterpart.outputs.ref }}
           path: .edge-checkout
 
       - name: Install Edge artifact (test-scope E2E dependency)

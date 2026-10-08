@@ -1,5 +1,6 @@
 package com.smartship.shore.kafka;
 
+import com.smartship.shore.persistence.MyBatisTestSupport;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -88,7 +89,7 @@ class HistoryConsumerTest {
         .addModule(new JavaTimeModule())
         .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
         .build();
-    repository = new TelemetryHistoryRepository(jdbc);
+    repository = MyBatisTestSupport.repository(jdbc);
     metrics = new ShoreMetrics(new SimpleMeterRegistry());
     consumer = new HistoryConsumer(repository, objectMapper, metrics);
     offsetSeq = 0L;

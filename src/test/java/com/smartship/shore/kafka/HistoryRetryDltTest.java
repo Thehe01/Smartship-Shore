@@ -1,5 +1,6 @@
 package com.smartship.shore.kafka;
 
+import com.smartship.shore.persistence.MyBatisTestSupport;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -117,7 +118,7 @@ class HistoryRetryDltTest {
         .addModule(new JavaTimeModule())
         .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
         .build();
-    repository = new TelemetryHistoryRepository(jdbc);
+    repository = MyBatisTestSupport.repository(jdbc);
     metrics = new ShoreMetrics(new SimpleMeterRegistry());
     consumer = new HistoryConsumer(repository, objectMapper, metrics);
 
@@ -220,7 +221,7 @@ class HistoryRetryDltTest {
   @Test
   @DisplayName("DB fails twice then succeeds → one row, retried, never DLT'd")
   void retryThenSuccess() {
-    TelemetryHistoryRepository flaky = spy(new TelemetryHistoryRepository(jdbc));
+    TelemetryHistoryRepository flaky = spy(MyBatisTestSupport.repository(jdbc));
     doThrow(new TransientDataAccessResourceException("lock timeout"))
         .doThrow(new TransientDataAccessResourceException("lock timeout"))
         .doCallRealMethod()

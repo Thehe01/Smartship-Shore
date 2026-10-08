@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.smartship.shore.persistence.TelemetryHistoryMapper">
+  <resultMap id="history" type="com.smartship.shore.persistence.TelemetryHistoryEntity">
+    <id column="id" property="id"/>
+    <result column="msg_id" property="msgId"/>
+    <result column="mmsi" property="mmsi"/>
+    <result column="type" property="type"/>
+    <result column="event_time" property="eventTime"/>
+    <result column="sent_at" property="sentAt"/>
+    <result column="received_at" property="receivedAt"/>
+    <result column="payload" property="payloadJson"/>
+    <result column="kafka_partition" property="kafkaPartition"/>
+    <result column="kafka_offset" property="kafkaOffset"/>
+  </resultMap>
+  <sql id="columns">msg_id, mmsi, type, event_time, sent_at, received_at, payload, kafka_partition, kafka_offset</sql>
+  <insert id="insert" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+    INSERT INTO ship_telemetry_history (<include refid="columns"/>)
+    VALUES (#{msgId,jdbcType=VARCHAR}, #{mmsi,jdbcType=VARCHAR}, #{type,jdbcType=VARCHAR},
+      #{eventTime,jdbcType=TIMESTAMP}, #{sentAt,jdbcType=TIMESTAMP}, #{receivedAt,jdbcType=TIMESTAMP},
+      #{payloadJson,jdbcType=LONGVARCHAR}, #{kafkaPartition,jdbcType=INTEGER}, #{kafkaOffset,jdbcType=BIGINT})
+  </insert>
+  <insert id="insertBatch">
+    INSERT INTO ship_telemetry_history (<include refid="columns"/>) VALUES
+    <foreach collection="entities" item="entity" separator=",">
+      (#{entity.msgId,jdbcType=VARCHAR}, #{entity.mmsi,jdbcType=VARCHAR}, #{entity.type,jdbcType=VARCHAR},
+       #{entity.eventTime,jdbcType=TIMESTAMP}, #{entity.sentAt,jdbcType=TIMESTAMP},
+       #{entity.receivedAt,jdbcType=TIMESTAMP}, #{entity.payloadJson,jdbcType=LONGVARCHAR},
+       #{entity.kafkaPartition,jdbcType=INTEGER}, #{entity.kafkaOffset,jdbcType=BIGINT})
+    </foreach>
+  </insert>
+  <select id="existsByMsgId" resultType="boolean">
+    SELECT COUNT(*) &gt; 0 FROM ship_telemetry_history WHERE msg_id = #{msgId}
+  </select>
+  <select id="existingMsgIds" resultType="string">
+    SELECT msg_id FROM ship_telemetry_history WHERE msg_id IN
+    <foreach collection="ids" item="id" open="(" separator="," close=")">#{id}</foreach>
+  </select>
+  <select id="findByMsgId" resultMap="history">
+    SELECT id, <include refid="columns"/> FROM ship_telemetry_history WHERE msg_id = #{msgId}
+  </select>
+  <select id="countAll" resultType="long">SELECT COUNT(*) FROM ship_telemetry_history</select>
+  <select id="countByMmsi" resultType="long">SELECT COUNT(*) FROM ship_telemetry_history WHERE mmsi = #{mmsi}</select>
+  <delete id="deleteAll">DELETE FROM ship_telemetry_history</delete>
+</mapper>
